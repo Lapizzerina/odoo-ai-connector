@@ -1,210 +1,265 @@
-// index.js
-// Servicio IA sencillo para analizar LEADS de Odoo
-// Ahora usando DeepSeek en lugar de OpenAI
+// index.js — odoo-ai-connector + DeepSeek
+// Node 18+ (Render) — usa fetch nativo
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
-const axios = require('axios');
+const express = require("express");
+const cors = require("cors");
 
 const app = express();
 
-// -------- Config básica --------
-const PORT = process.env.PORT || 10000;
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
-const SECURITY_TOKEN = process.env.SECURITY_TOKEN || 'CAMBIA_ESTO';
+const SERVICE_NAME = "odoo-ai-connector";
+const VERSION = "v1.1.0";
 
-// Middlewares
-app.use(express.json({ limit: '1mb' }));
+// ⚙️ Configuración básica
 app.use(cors());
-app.use(morgan('tiny'));
+app.use(
+  express.json({
+    limit: "1mb",
+  })
+);
 
-// ---------- Ruta raíz (para que no salga "Cannot GET /") ----------
-app.get('/', (req, res) => {
-  res.json({
+// 🟢 Healthcheck simple
+app.get("/health", (req, res) => {
+  return res.json({
     ok: true,
-    service: 'odoo-ai-connector',
-    message: 'Usa GET /health o POST /lead/analyze',
+    service: SERVICE_NAME,
+    version: VERSION,
+    message: "Usa GET /health o POST /lead/analyze",
   });
 });
 
-// ---------- Healthcheck ----------
-app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'odoo-ai-connector', uptime: process.uptime() });
-});
+// 🧠 Prompt de sistema para DeepSeek (JSON estricto)
+function buildSystemPrompt() {
+  return `
+Eres un analizador automático de leads para la empresa Piznalia / La Pizzerina / SmartChef24h.
+Tu tarea es analizar mensajes de clientes y devolver SIEMPRE un JSON válido (json) con este formato:
 
-// --------- Helper IA (DeepSeek) ----------
-async function analyzeLeadWithAI(payload) {
-  if (!DEEPSEEK_API_KEY) {
-    throw new Error('Falta DEEPSEEK_API_KEY en variables de entorno');
+EJEMPLO DE JSON DESEADO:
+{
+  "intencion": "maquina",
+  "idioma": "es",
+  "pais": "España",
+  "urgencia": "alta",
+  "resumen": "Quiere información para comprar una máquina en Barcelona",
+  "pregunta": "¿Qué precio tiene la máquina y cómo funciona el servicio?",
+  "datos_detectados": {
+    "cantidad": "1 máquina",
+    "ubicacion": "Barcelona",
+    "plazo": "próximos meses"
+  }
+}
+
+Las intenciones posibles son SOLO estas:
+- "maquina" (interesado en comprar una máquina SmartChef24h)
+- "pizzas" (interesado solo en pizzas)
+- "ambos"
+- "operador" (quiere operar máquinas)
+- "soporte" (duda técnica de máquina / ticket)
+- "info" (pregunta general)
+- "otros"
+
+Reglas para el JSON de salida:
+- Devuelve SIEMPRE un único objeto JSON, sin texto antes ni después.
+- Campos obligatorios:
+  - "intencion": una de las opciones indicadas.
+  - "idioma": "es", "ca", "en", "fr", "pt" (elige el idioma principal del mensaje).
+  - "pais": nombre normalizado: España, Portugal, Francia, Andorra, Chile, México, Argentina, etc.
+    - Si no se puede saber, pon "Desconocido".
+  - "urgencia": "alta", "media" o "baja".
+  - "resumen": frase breve con lo que quiere el cliente.
+  - "pregunta": resumen de la duda o petición principal.
+  - "datos_detectados": objeto con:
+      "cantidad": texto breve (ej. "1 máquina", "varias máquinas", "no especifica").
+      "ubicacion": ciudad / zona si se menciona (o "no especifica").
+      "plazo": plazo aproximado si se menciona (o "no especifica").
+- No inventes datos que no estén en el mensaje. Si no sabes algo, pon "no especifica" o "Desconocido".
+- RESPONDE SIEMPRE SOLO CON JSON VÁLIDO.
+`;
+}
+
+// 🧾 Prompt de usuario: mensaje + meta
+function buildUserPrompt(text, meta) {
+  const origen = meta?.origen || meta?.source || "";
+  const canal = meta?.canal || meta?.channel || "";
+  const nombre = meta?.nombre || meta?.name || "";
+  const email = meta?.email || "";
+
+  let contexto = "Mensaje de un cliente.\n\n";
+  if (origen) contexto += `Origen: ${origen}\n`;
+  if (canal) contexto += `Canal: ${canal}\n`;
+  if (nombre) contexto += `Nombre: ${nombre}\n`;
+  if (email) contexto += `Email: ${email}\n`;
+
+  contexto += `\nTEXTO DEL CLIENTE:\n${text}\n\n`;
+  contexto +=
+    "Devuelve SOLO el JSON siguiendo exactamente el formato indicado en el prompt del sistema.";
+
+  return contexto;
+}
+
+// 🧠 Llamada a DeepSeek
+async function callDeepSeekJSON(systemPrompt, userPrompt) {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
+
+  if (!apiKey) {
+    throw new Error("Falta la variable de entorno DEEPSEEK_API_KEY");
   }
 
-  const {
-    id,
-    name,
-    description,
-    email_from,
-    phone,
-    tags = [],
-    origin,
-  } = payload;
+  const url = "https://api.deepseek.com/chat/completions";
 
-  const systemPrompt = `
-Eres un asistente de ventas para Piznalia / La Pizzerina.
-Analizas leads de Odoo y devuelves SIEMPRE un JSON válido.
+  const body = {
+    model,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    temperature: 0.1,
+    max_tokens: 512,
+    response_format: { type: "json_object" },
+  };
 
-Campos a devolver:
-- "status": uno de ["pendiente", "priorizar", "no_interesado"]
-- "respuesta": texto de respuesta profesional y cercana en ESPAÑOL para enviar al cliente (o cadena vacía si no procede).
-- "resumen": resumen breve en español de la situación del lead.
-- "motivo": etiqueta corta en minúsculas y sin espacios (por ejemplo: "solicitud_informacion", "precio_alto", "solo_curiosidad").
-
-Reglas:
-- Si parece un lead caliente o muy interesante => status = "priorizar".
-- Si parece un lead normal => status = "pendiente".
-- Si claramente no está interesado o es SPAM => status = "no_interesado".
-- No añadas texto fuera del JSON.
-  `;
-
-  const userPrompt = `
-Datos del lead de Odoo:
-
-- ID: ${id}
-- Nombre: ${name || ''}
-- Descripción / notas: ${description || ''}
-- Email: ${email_from || ''}
-- Teléfono: ${phone || ''}
-- Etiquetas: ${Array.isArray(tags) ? tags.join(', ') : ''}
-- Origen: ${origin || ''}
-
-Devuelve SOLO un JSON con esta estructura:
-
-{
-  "status": "...",
-  "respuesta": "...",
-  "resumen": "...",
-  "motivo": "..."
-}
-  `;
-
-  const response = await axios.post(
-    'https://api.deepseek.com/chat/completions',
-    {
-      model: 'deepseek-chat',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.4,
-      stream: false,
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
     },
-    {
-      headers: {
-        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      timeout: 20000,
-    }
-  );
+    body: JSON.stringify(body),
+  });
 
-  const content = response.data.choices?.[0]?.message?.content || '{}';
+  if (!resp.ok) {
+    const errorText = await resp.text().catch(() => "");
+    const msg = `Error DeepSeek HTTP ${resp.status}: ${errorText}`;
+    throw new Error(msg);
+  }
 
-  // Intentamos parsear el JSON que devuelve el modelo
+  const data = await resp.json();
+
+  const content =
+    data?.choices?.[0]?.message?.content &&
+    String(data.choices[0].message.content).trim();
+
+  if (!content) {
+    throw new Error("DeepSeek devolvió contenido vacío");
+  }
+
   let parsed;
   try {
     parsed = JSON.parse(content);
-  } catch (err) {
-    console.error('Error parseando JSON de DeepSeek:', err);
-    // Fallback mínimo para no romper Odoo
-    parsed = {
-      status: 'pendiente',
-      respuesta: '',
-      resumen: 'No se pudo analizar correctamente el lead con IA.',
-      motivo: 'error_parseo',
-    };
+  } catch (e) {
+    // Log ligero, sin datos sensibles
+    console.error("[DeepSeek] Error parseando JSON:", e.message, content);
+    throw new Error("error_parseo_json");
   }
 
   return parsed;
 }
 
-// ---------- Endpoint principal ----------
-// POST /lead/analyze
-// Odoo llamará a este endpoint con los datos del lead
-app.post('/lead/analyze', async (req, res) => {
+// 🧩 Normalizar salida para que Odoo la use fácil
+function normalizeAIResult(parsed) {
+  const intencion = parsed.intencion || parsed.intent || "otros";
+  const idioma = parsed.idioma || parsed.language || "es";
+  const pais = parsed.pais || parsed.country || "Desconocido";
+  const urgencia = parsed.urgencia || parsed.urgency || "media";
+  const resumen = parsed.resumen || "";
+  const pregunta = parsed.pregunta || "";
+
+  const datos_detectados = parsed.datos_detectados || parsed.data || {};
+
+  return {
+    intencion,
+    idioma,
+    pais,
+    urgencia,
+    resumen,
+    pregunta,
+    datos_detectados,
+    raw: parsed,
+  };
+}
+
+// 📥 Endpoint principal: analizar lead
+app.post("/lead/analyze", async (req, res) => {
+  const body = req.body || {};
+
+  const text =
+    body.text || body.mensaje || body.message || body.content || "";
+
+  if (!text || !String(text).trim()) {
+    return res.status(400).json({
+      ok: false,
+      service: SERVICE_NAME,
+      error: "missing_text",
+      message:
+        "Debes enviar al menos un campo 'text', 'mensaje' o 'message' con contenido.",
+    });
+  }
+
+  const meta = {
+    origen: body.origen || body.source,
+    canal: body.canal || body.channel,
+    nombre: body.nombre || body.name,
+    email: body.email,
+  };
+
+  const systemPrompt = buildSystemPrompt();
+  const userPrompt = buildUserPrompt(String(text), meta);
+
   try {
-    // Seguridad básica con token
-    const token = req.headers['x-security-token'];
-    if (!token || token !== SECURITY_TOKEN) {
-      return res.status(401).json({ ok: false, error: 'UNAUTHORIZED' });
-    }
-
-    const leadData = req.body || {};
-
-    // Si marcamos que viene de "web" y quieres saltarlo, se puede hacer aquí:
-    const tags = leadData.tags || [];
-    const hasWebTag =
-      Array.isArray(tags) && tags.some((t) => String(t).toLowerCase().includes('web'));
-    if (hasWebTag) {
-      return res.json({
-        ok: true,
-        skipped: true,
-        reason: 'lead_origen_web',
-        ai: {
-          status: 'pendiente',
-          respuesta: '',
-          resumen: 'Lead proveniente de formulario web con automatización propia.',
-          motivo: 'origen_web',
-        },
-      });
-    }
-
-    const aiResult = await analyzeLeadWithAI(leadData);
+    const parsed = await callDeepSeekJSON(systemPrompt, userPrompt);
+    const normalized = normalizeAIResult(parsed);
 
     return res.json({
       ok: true,
-      skipped: false,
-      ai: aiResult,
+      service: SERVICE_NAME,
+      demo: false,
+      ai: {
+        status: "ok",
+        // compatibilidad con versión anterior
+        resumen: normalized.resumen,
+        respuesta: normalized.raw,
+        motivo: null,
+
+        // campos directos para Odoo / automatizaciones
+        intencion: normalized.intencion,
+        idioma: normalized.idioma,
+        pais: normalized.pais,
+        urgencia: normalized.urgencia,
+        pregunta: normalized.pregunta,
+        datos_detectados: normalized.datos_detectados,
+      },
     });
   } catch (err) {
-    console.error('Error en /lead/analyze:', err?.response?.data || err.message || err);
-    return res.status(500).json({
-      ok: false,
-      error: 'INTERNAL_ERROR',
-      details: err.message,
-    });
-  }
-});
+    console.error("[/lead/analyze] Error:", err.message);
 
-// ---------- Endpoint de prueba rápida (sin Odoo) ----------
-// GET /debug/demo-lead
-app.get('/debug/demo-lead', async (req, res) => {
-  try {
-    const demoLead = {
-      id: 999,
-      name: 'Prueba demo IA',
-      description:
-        'Hola, estoy interesado en vuestra máquina SmartChef24h para un local en Girona. Me gustaría saber precios y condiciones de renting.',
-      email_from: 'demo@cliente.com',
-      phone: '+34600111222',
-      tags: ['demo', 'instagram'],
-      origin: 'demo',
-    };
+    // Diferenciar fallo de parseo vs fallo HTTP u otros
+    const isParseError = err.message === "error_parseo_json";
 
-    const aiResult = await analyzeLeadWithAI(demoLead);
-
-    res.json({
+    return res.status(200).json({
       ok: true,
+      service: SERVICE_NAME,
       demo: true,
-      ai: aiResult,
+      ai: {
+        status: "pendiente",
+        respuesta: "",
+        resumen:
+          "No se pudo analizar correctamente el lead con IA.",
+        motivo: isParseError ? "error_parseo" : err.message,
+      },
     });
-  } catch (err) {
-    console.error('Error en /debug/demo-lead:', err?.response?.data || err.message || err);
-    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// ---------- Arranque ----------
-app.listen(PORT, () => {
-  console.log(`✅ odoo-ai-connector escuchando en puerto ${PORT}`);
+// 🌍 Fallback root
+app.get("/", (req, res) => {
+  return res.json({
+    ok: true,
+    service: SERVICE_NAME,
+    message: "Usa GET /health o POST /lead/analyze",
+  });
 });
+
+// 🚀 Arranque
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log
