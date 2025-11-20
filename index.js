@@ -6,7 +6,7 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.2.1";
+const VERSION = "v1.2.2";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
@@ -327,6 +327,7 @@ async function createOdooLead(ai, originalBody) {
     originalBody.content ||
     "";
 
+  // 🔹 SOLO CAMPOS ESTÁNDAR DE crm.lead (nada x_*)
   const vals = {
     name: ai.resumen || ai.pregunta || "Nuevo lead desde IA",
     contact_name: partnerName,
@@ -350,11 +351,6 @@ Datos detectados: ${JSON.stringify(ai.datos_detectados || {})}
 Origen: ${origin}
 Canal: ${channel}
     `.trim(),
-    // Estos campos x_* solo tendrán efecto si luego los creamos en Odoo.
-    x_intencion_ai: ai.intencion,
-    x_pais_ai: ai.pais,
-    x_idioma_ai: ai.idioma,
-    x_urgencia_ai: ai.urgencia,
   };
 
   const url = `${ODOO_BASE_URL}/jsonrpc`;
@@ -383,7 +379,6 @@ Canal: ${channel}
 
   const data = await resp.json();
 
-  // 🔍 Nueva parte: mostrar el error real de Odoo si lo hay
   if (data.error) {
     console.error("[Odoo create lead] error:", JSON.stringify(data.error));
     const msg =
@@ -398,7 +393,7 @@ Canal: ${channel}
     throw new Error("Odoo no devolvió un ID numérico de lead");
   }
 
-  return data.result; // id del lead
+  return data.result;
 }
 
 // ============ ENDPOINT IA + CREACIÓN LEAD ============
