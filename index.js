@@ -2,20 +2,35 @@
 // Node 18+ (Render) — usa fetch nativo
 
 const express = require("express");
-const cors = require("cors");
 
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.1.0";
+const VERSION = "v1.1.1";
 
 // ⚙️ Configuración básica
-app.use(cors());
 app.use(
   express.json({
     limit: "1mb",
   })
 );
+
+// Middleware CORS sencillo (sin librerías externas)
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Origin, X-Requested-With, Content-Type, Accept"
+  );
+  res.header(
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 // 🟢 Healthcheck simple
 app.get("/health", (req, res) => {
@@ -147,7 +162,6 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
   try {
     parsed = JSON.parse(content);
   } catch (e) {
-    // Log ligero, sin datos sensibles
     console.error("[DeepSeek] Error parseando JSON:", e.message, content);
     throw new Error("error_parseo_json");
   }
@@ -215,12 +229,9 @@ app.post("/lead/analyze", async (req, res) => {
       demo: false,
       ai: {
         status: "ok",
-        // compatibilidad con versión anterior
         resumen: normalized.resumen,
         respuesta: normalized.raw,
         motivo: null,
-
-        // campos directos para Odoo / automatizaciones
         intencion: normalized.intencion,
         idioma: normalized.idioma,
         pais: normalized.pais,
@@ -232,7 +243,6 @@ app.post("/lead/analyze", async (req, res) => {
   } catch (err) {
     console.error("[/lead/analyze] Error:", err.message);
 
-    // Diferenciar fallo de parseo vs fallo HTTP u otros
     const isParseError = err.message === "error_parseo_json";
 
     return res.status(200).json({
@@ -262,4 +272,7 @@ app.get("/", (req, res) => {
 // 🚀 Arranque
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log
+  console.log(
+    `[${SERVICE_NAME}] v${VERSION} escuchando en puerto ${PORT}`
+  );
+});
