@@ -6,13 +6,14 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.2.2";
+const VERSION = "v1.3.0";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
 const ODOO_DB = process.env.ODOO_DB;             // ej: piznalia1
 const ODOO_USER_EMAIL = process.env.ODOO_USER_EMAIL;
 const ODOO_API_KEY = process.env.ODOO_API_KEY;
+const ODOO_APPOINTMENT_URL = process.env.ODOO_APPOINTMENT_URL || "";
 
 // cache simple de uid
 let cachedOdooUid = null;
@@ -71,12 +72,12 @@ EJEMPLO DE JSON DESEADO:
 }
 
 Las intenciones posibles son SOLO estas:
-- "maquina"
-- "pizzas"
+- "maquina" (interesado en máquina SmartChef24h u otras máquinas)
+- "pizzas" (solo producto pizzas / alimentación)
 - "ambos"
-- "operador"
-- "soporte"
-- "info"
+- "operador" (quiere operar o gestionar máquinas)
+- "soporte" (duda técnica / incidencia)
+- "info" (pregunta general)
 - "otros"
 
 Reglas:
@@ -88,7 +89,10 @@ Reglas:
   - "urgencia": "alta", "media" o "baja".
   - "resumen": frase breve con lo que quiere el cliente.
   - "pregunta": resumen de la duda o petición principal.
-  - "datos_detectados": objeto con "cantidad", "ubicacion", "plazo".
+  - "datos_detectados": objeto con:
+      "cantidad": texto breve (ej. "1 máquina", "varias máquinas", "no especifica");
+      "ubicacion": ciudad / zona si se menciona (o "no especifica");
+      "plazo": plazo aproximado si se menciona (o "no especifica").
 - No inventes datos. Si no sabes algo, pon "no especifica" o "Desconocido".
 - RESPONDE SIEMPRE SOLO CON JSON VÁLIDO.
 `;
@@ -305,6 +309,278 @@ async function authenticateOdoo() {
   return uid;
 }
 
+// Buscar país por nombre (res.country)
+async function getCountryIdByName(uid, countryName) {
+  if (!countryName || countryName.toLowerCase() === "desconocido") {
+    return null;
+  }
+
+  const url = `${ODOO_BASE_URL}/jsonrpc`;
+
+  const body = {
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "object",
+      method: "execute_kw",
+      args: [
+        ODOO_DB,
+        uid,
+        ODOO_API_KEY,
+        "res.country",
+        "search",
+        [[["name", "ilike", countryName]]],
+        { limit: 1 },
+      ],
+    },
+    id: 10,
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    console.error("Error buscando país:", text);
+    return null;
+  }
+
+  const data = await resp.json();
+  if (data.error) {
+    console.error("Odoo error buscando país:", JSON.stringify(data.error));
+    return null;
+  }
+
+  const ids = data.result || [];
+  return ids.length ? ids[0] : null;
+}
+
+// Buscar tags por nombre (crm.tag)
+async function getTagIdsByNames(uid, names) {
+  const clean = (names || [])
+    .map((n) => String(n || "").trim())
+    .filter((n) => n.length > 0);
+
+  if (!clean.length) return [];
+
+  const url = `${ODOO_BASE_URL}/jsonrpc`;
+
+  const body = {
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "object",
+      method: "execute_kw",
+      args: [
+        ODOO_DB,
+        uid,
+        ODOO_API_KEY,
+        "crm.tag",
+        "search_read",
+        [[["name", "in", clean]]],
+        { fields: ["id", "name"], limit: clean.length },
+      ],
+    },
+    id: 11,
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    console.error("Error buscando tags:", text);
+    return [];
+  }
+
+  const data = await resp.json();
+  if (data.error) {
+    console.error("Odoo error buscando tags:", JSON.stringify(data.error));
+    return [];
+  }
+
+  const found = data.result || [];
+  return found.map((t) => t.id);
+}
+
+// Construir tags a partir de IA + origen / canal
+function buildTagNames(ai, originalBody) {
+  const tagNames = [];
+
+  // Intención → tags ya creadas
+  const intencion = (ai.intencion || "").toLowerCase();
+  switch (intencion) {
+    case "maquina":
+      tagNames.push("Máquina de Pizzas y comida");
+      break;
+    case "pizzas":
+      tagNames.push("Pizza sector Horeca");
+      break;
+    case "ambos":
+      tagNames.push("Ambos");
+      break;
+    case "operador":
+      tagNames.push("Operador vending");
+      break;
+    case "soporte":
+      tagNames.push("IA: Soporte técnico");
+      break;
+    case "info":
+      tagNames.push("IA: Información general");
+      break;
+    case "otros":
+      tagNames.push("Otros");
+      break;
+    default:
+      tagNames.push("IA: Revisar manualmente");
+      break;
+  }
+
+  // Urgencia
+  const urg = (ai.urgencia || "").toLowerCase();
+  if (urg === "alta") tagNames.push("Urgencia: alta");
+  else if (urg === "media") tagNames.push("Urgencia: media");
+  else if (urg === "baja") tagNames.push("Urgencia: baja");
+
+  // Origen
+  const origen = (originalBody.origen || originalBody.source || "").toLowerCase();
+  if (origen === "web") tagNames.push("Origen: web");
+  else if (origen === "email") tagNames.push("Origen: email");
+  else if (origen === "telefono" || origen === "teléfono")
+    tagNames.push("Origen: teléfono");
+  else if (origen === "red_social" || origen === "redes" || origen === "social")
+    tagNames.push("Origen: redes sociales");
+  else if (origen === "cita") tagNames.push("Origen: cita");
+
+  // Canal
+  const canal = (originalBody.canal || originalBody.channel || "").toLowerCase();
+  if (canal === "formulario") tagNames.push("Canal: formulario");
+  else if (canal === "llamada") tagNames.push("Canal: llamada");
+  else if (canal === "whatsapp") tagNames.push("Canal: WhatsApp");
+  else if (canal === "instagram") tagNames.push("Canal: Instagram");
+  else if (canal === "facebook") tagNames.push("Canal: Facebook");
+  else if (canal === "cita") tagNames.push("Canal: cita");
+
+  // Tipo IA genérico si no se ha añadido nada aún
+  if (
+    !tagNames.some((n) =>
+      n.startsWith("IA:")
+    ) &&
+    ["maquina", "pizzas", "ambos", "operador"].includes(intencion)
+  ) {
+    tagNames.push("IA: Lead válido");
+  }
+
+  if (!tagNames.some((n) => n.startsWith("IA:"))) {
+    tagNames.push("IA: Revisar manualmente");
+  }
+
+  // Eliminar duplicados
+  return Array.from(new Set(tagNames));
+}
+
+// Construir sugerencia de respuesta (x_respuesta_ia)
+function buildSuggestedReply(ai, originalBody) {
+  const nombre =
+    originalBody.nombre ||
+    originalBody.name ||
+    originalBody.contact_name ||
+    "Hola";
+  const idioma = (ai.idioma || "es").toLowerCase();
+  const intencion = (ai.intencion || "").toLowerCase();
+  const urg = (ai.urgencia || "").toLowerCase();
+  const pais = ai.pais || "";
+  const datos = ai.datos_detectados || {};
+  const ubicacion =
+    datos.ubicacion && datos.ubicacion.toLowerCase() !== "no especifica"
+      ? datos.ubicacion
+      : "";
+  const citaUrl = ODOO_APPOINTMENT_URL;
+
+  const baseNombre = nombre ? `Hola ${nombre},` : "Hola,";
+
+  // De momento nos centramos en español; en inglés hacemos versión simple
+  const isSpanish = idioma === "es" || idioma === "ca";
+
+  if (!isSpanish) {
+    // Versión muy simple en inglés
+    let msg = `${baseNombre} thank you for contacting us.\n\n`;
+    if (intencion === "maquina" || intencion === "operador" || intencion === "ambos") {
+      msg +=
+        "We will send you information about our vending machines (SmartChef24h) and commercial conditions.\n";
+    } else if (intencion === "pizzas") {
+      msg +=
+        "We will send you information about our pizzas catalog, formats and prices.\n";
+    } else if (intencion === "soporte") {
+      msg +=
+        "We have received your technical support request and we'll review it as soon as possible.\n";
+    } else {
+      msg += "We will reply with the information you requested.\n";
+    }
+    if (
+      citaUrl &&
+      (intencion === "maquina" ||
+        intencion === "operador" ||
+        intencion === "ambos")
+    ) {
+      msg += `\nIf you prefer, you can book a call here: ${citaUrl}`;
+    }
+    return msg.trim();
+  }
+
+  // Versión española
+  let msg = `${baseNombre} gracias por contactar con Piznalia / La Pizzerina.\n\n`;
+
+  if (intencion === "maquina" || intencion === "operador" || intencion === "ambos") {
+    msg +=
+      "Hemos recibido tu consulta sobre nuestras máquinas SmartChef24h y las condiciones para instalarlas";
+    if (ubicacion) {
+      msg += ` en ${ubicacion}`;
+    } else if (pais && pais !== "Desconocido") {
+      msg += ` en ${pais}`;
+    }
+    msg +=
+      ". Te enviaremos una propuesta adaptada a tu caso (ubicación, previsión de ventas y modelo de colaboración).\n";
+  } else if (intencion === "pizzas") {
+    msg +=
+      "Hemos recibido tu interés por nuestras pizzas. Te enviaremos información sobre catálogo, formatos, precios y condiciones de suministro";
+    if (pais && pais !== "Desconocido") msg += ` para ${pais}`;
+    msg += ".\n";
+  } else if (intencion === "soporte") {
+    msg +=
+      "Hemos recibido tu consulta de soporte técnico. Vamos a revisar el caso y te responderemos con las instrucciones y pasos a seguir lo antes posible.\n";
+  } else if (intencion === "info") {
+    msg +=
+      "Hemos recibido tu consulta y te responderemos con la información que necesitas.\n";
+  } else {
+    msg +=
+      "Hemos recibido tu mensaje y lo revisaremos para darte la mejor respuesta posible.\n";
+  }
+
+  // Propuesta de cita sólo si tiene sentido
+  const puedeOfrecerCita =
+    citaUrl &&
+    (intencion === "maquina" || intencion === "operador" || intencion === "ambos" || intencion === "info") &&
+    urg !== "baja";
+
+  if (puedeOfrecerCita) {
+    msg +=
+      "\nSi lo prefieres, podemos comentarlo en detalle en una llamada.\n";
+    msg += `Puedes agendar una cita directamente aquí: ${citaUrl}\n`;
+  }
+
+  msg += "\nUn saludo,\nEquipo Piznalia / La Pizzerina";
+
+  return msg.trim();
+}
+
+// Crear lead en Odoo con todos los campos
 async function createOdooLead(ai, originalBody) {
   const uid = await authenticateOdoo();
 
@@ -327,7 +603,32 @@ async function createOdooLead(ai, originalBody) {
     originalBody.content ||
     "";
 
-  // 🔹 SOLO CAMPOS ESTÁNDAR DE crm.lead (nada x_*)
+  // City a partir de datos_detectados.ubicacion
+  let city = "";
+  if (ai.datos_detectados && ai.datos_detectados.ubicacion) {
+    const u = String(ai.datos_detectados.ubicacion).trim();
+    if (u && u.toLowerCase() !== "no especifica") {
+      city = u;
+    }
+  }
+
+  // Prioridad según urgencia
+  let priority = "1"; // baja por defecto
+  const urg = (ai.urgencia || "").toLowerCase();
+  if (urg === "alta") priority = "3";
+  else if (urg === "media") priority = "2";
+  else if (urg === "baja") priority = "1";
+
+  // País → country_id
+  const countryId = await getCountryIdByName(uid, ai.pais);
+
+  // Tags
+  const tagNames = buildTagNames(ai, originalBody);
+  const tagIds = await getTagIdsByNames(uid, tagNames);
+
+  // Sugerencia de respuesta
+  const suggestedReply = buildSuggestedReply(ai, originalBody);
+
   const vals = {
     name: ai.resumen || ai.pregunta || "Nuevo lead desde IA",
     contact_name: partnerName,
@@ -351,7 +652,19 @@ Datos detectados: ${JSON.stringify(ai.datos_detectados || {})}
 Origen: ${origin}
 Canal: ${channel}
     `.trim(),
+    priority,
+    city: city || undefined,
+    country_id: countryId || undefined,
+    // Campos personalizados de IA
+    x_estado_ia: "ok",
+    x_resumen_ia: ai.resumen || "",
+    x_respuesta_ia: suggestedReply,
   };
+
+  if (tagIds.length) {
+    // Many2many: set ids
+    vals.tag_ids = [[6, 0, tagIds]];
+  }
 
   const url = `${ODOO_BASE_URL}/jsonrpc`;
 
