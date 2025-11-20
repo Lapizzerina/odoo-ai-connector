@@ -6,7 +6,7 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.3.0";
+const VERSION = "v1.3.1";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
@@ -469,9 +469,7 @@ function buildTagNames(ai, originalBody) {
 
   // Tipo IA genérico si no se ha añadido nada aún
   if (
-    !tagNames.some((n) =>
-      n.startsWith("IA:")
-    ) &&
+    !tagNames.some((n) => n.startsWith("IA:")) &&
     ["maquina", "pizzas", "ambos", "operador"].includes(intencion)
   ) {
     tagNames.push("IA: Lead válido");
@@ -566,12 +564,14 @@ function buildSuggestedReply(ai, originalBody) {
   // Propuesta de cita sólo si tiene sentido
   const puedeOfrecerCita =
     citaUrl &&
-    (intencion === "maquina" || intencion === "operador" || intencion === "ambos" || intencion === "info") &&
+    (intencion === "maquina" ||
+      intencion === "operador" ||
+      intencion === "ambos" ||
+      intencion === "info") &&
     urg !== "baja";
 
   if (puedeOfrecerCita) {
-    msg +=
-      "\nSi lo prefieres, podemos comentarlo en detalle en una llamada.\n";
+    msg += "\nSi lo prefieres, podemos comentarlo en detalle en una llamada.\n";
     msg += `Puedes agendar una cita directamente aquí: ${citaUrl}\n`;
   }
 
@@ -655,8 +655,7 @@ Canal: ${channel}
     priority,
     city: city || undefined,
     country_id: countryId || undefined,
-    // Campos personalizados de IA
-    x_estado_ia: "ok",
+    // Campos personalizados de IA (dejamos fuera x_estado_ia por tipo de campo)
     x_resumen_ia: ai.resumen || "",
     x_respuesta_ia: suggestedReply,
   };
