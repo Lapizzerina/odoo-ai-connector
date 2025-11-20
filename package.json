@@ -1,0 +1,16 @@
+{
+  "name": "odoo-ai-connector",
+  "version": "1.0.0",
+  "description": "Conector IA entre Odoo (piznalia1) y OpenAI en Render",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.19.0",
+    "morgan": "^1.10.0"
+  }
+}
