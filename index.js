@@ -20,6 +20,15 @@ app.use(express.json({ limit: '1mb' }));
 app.use(cors());
 app.use(morgan('tiny'));
 
+// ---------- Ruta raíz (para que no salga "Cannot GET /") ----------
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'odoo-ai-connector',
+    message: 'Usa GET /health o POST /lead/analyze',
+  });
+});
+
 // ---------- Healthcheck ----------
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'odoo-ai-connector', uptime: process.uptime() });
@@ -38,7 +47,7 @@ async function analyzeLeadWithAI(payload) {
     email_from,
     phone,
     tags = [],
-    origin
+    origin,
   } = payload;
 
   const systemPrompt = `
@@ -85,16 +94,16 @@ Devuelve SOLO un JSON con esta estructura:
       model: 'gpt-4o-mini', // puedes cambiar a otro modelo si quieres
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
+        { role: 'user', content: userPrompt },
       ],
-      temperature: 0.4
+      temperature: 0.4,
     },
     {
       headers: {
         Authorization: `Bearer ${OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
       },
-      timeout: 20000
+      timeout: 20000,
     }
   );
 
@@ -111,7 +120,7 @@ Devuelve SOLO un JSON con esta estructura:
       status: 'pendiente',
       respuesta: '',
       resumen: 'No se pudo analizar correctamente el lead con IA.',
-      motivo: 'error_parseo'
+      motivo: 'error_parseo',
     };
   }
 
@@ -133,7 +142,8 @@ app.post('/lead/analyze', async (req, res) => {
 
     // Si marcamos que viene de "web" y quieres saltarlo, se puede hacer aquí:
     const tags = leadData.tags || [];
-    const hasWebTag = Array.isArray(tags) && tags.some(t => String(t).toLowerCase().includes('web'));
+    const hasWebTag =
+      Array.isArray(tags) && tags.some((t) => String(t).toLowerCase().includes('web'));
     if (hasWebTag) {
       return res.json({
         ok: true,
@@ -143,8 +153,8 @@ app.post('/lead/analyze', async (req, res) => {
           status: 'pendiente',
           respuesta: '',
           resumen: 'Lead proveniente de formulario web con automatización propia.',
-          motivo: 'origen_web'
-        }
+          motivo: 'origen_web',
+        },
       });
     }
 
@@ -153,15 +163,43 @@ app.post('/lead/analyze', async (req, res) => {
     return res.json({
       ok: true,
       skipped: false,
-      ai: aiResult
+      ai: aiResult,
     });
   } catch (err) {
     console.error('Error en /lead/analyze:', err);
     return res.status(500).json({
       ok: false,
       error: 'INTERNAL_ERROR',
-      details: err.message
+      details: err.message,
     });
+  }
+});
+
+// ---------- Endpoint de prueba rápida (sin Odoo) ----------
+// GET /debug/demo-lead
+app.get('/debug/demo-lead', async (req, res) => {
+  try {
+    const demoLead = {
+      id: 999,
+      name: 'Prueba demo IA',
+      description:
+        'Hola, estoy interesado en vuestra máquina SmartChef24h para un local en Girona. Me gustaría saber precios y condiciones de renting.',
+      email_from: 'demo@cliente.com',
+      phone: '+34600111222',
+      tags: ['demo', 'instagram'],
+      origin: 'demo',
+    };
+
+    const aiResult = await analyzeLeadWithAI(demoLead);
+
+    res.json({
+      ok: true,
+      demo: true,
+      ai: aiResult,
+    });
+  } catch (err) {
+    console.error('Error en /debug/demo-lead:', err);
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
