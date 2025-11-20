@@ -6,7 +6,7 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.2.0";
+const VERSION = "v1.2.1";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
@@ -50,7 +50,6 @@ app.get("/health", (req, res) => {
 
 // ============ IA (DeepSeek) ============
 
-// Prompt de sistema para DeepSeek
 function buildSystemPrompt() {
   return `
 Eres un analizador automático de leads para la empresa Piznalia / La Pizzerina / SmartChef24h.
@@ -72,34 +71,29 @@ EJEMPLO DE JSON DESEADO:
 }
 
 Las intenciones posibles son SOLO estas:
-- "maquina" (interesado en comprar una máquina SmartChef24h)
-- "pizzas" (interesado solo en pizzas)
+- "maquina"
+- "pizzas"
 - "ambos"
-- "operador" (quiere operar máquinas)
-- "soporte" (duda técnica de máquina / ticket)
-- "info" (pregunta general)
+- "operador"
+- "soporte"
+- "info"
 - "otros"
 
-Reglas para el JSON de salida:
+Reglas:
 - Devuelve SIEMPRE un único objeto JSON, sin texto antes ni después.
 - Campos obligatorios:
   - "intencion": una de las opciones indicadas.
   - "idioma": "es", "ca", "en", "fr", "pt".
-  - "pais": nombre normalizado (España, Portugal, Francia, Andorra, Chile, México, Argentina, etc.).
-    - Si no se puede saber, pon "Desconocido".
+  - "pais": nombre normalizado; si no se sabe, "Desconocido".
   - "urgencia": "alta", "media" o "baja".
   - "resumen": frase breve con lo que quiere el cliente.
   - "pregunta": resumen de la duda o petición principal.
-  - "datos_detectados": objeto con:
-      "cantidad": texto breve (ej. "1 máquina", "varias máquinas", "no especifica").
-      "ubicacion": ciudad / zona si se menciona (o "no especifica").
-      "plazo": plazo aproximado si se menciona (o "no especifica").
-- No inventes datos que no estén en el mensaje. Si no sabes algo, pon "no especifica" o "Desconocido".
+  - "datos_detectados": objeto con "cantidad", "ubicacion", "plazo".
+- No inventes datos. Si no sabes algo, pon "no especifica" o "Desconocido".
 - RESPONDE SIEMPRE SOLO CON JSON VÁLIDO.
 `;
 }
 
-// Prompt de usuario: mensaje + meta
 function buildUserPrompt(text, meta) {
   const origen = meta?.origen || meta?.source || "";
   const canal = meta?.canal || meta?.channel || "";
@@ -119,7 +113,6 @@ function buildUserPrompt(text, meta) {
   return contexto;
 }
 
-// Llamada a DeepSeek
 async function callDeepSeekJSON(systemPrompt, userPrompt) {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
@@ -177,7 +170,6 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
   return parsed;
 }
 
-// Normalizar salida IA
 function normalizeAIResult(parsed) {
   const intencion = parsed.intencion || parsed.intent || "otros";
   const idioma = parsed.idioma || parsed.language || "es";
@@ -185,7 +177,6 @@ function normalizeAIResult(parsed) {
   const urgencia = parsed.urgencia || parsed.urgency || "media";
   const resumen = parsed.resumen || "";
   const pregunta = parsed.pregunta || "";
-
   const datos_detectados = parsed.datos_detectados || parsed.data || {};
 
   return {
@@ -200,11 +191,10 @@ function normalizeAIResult(parsed) {
   };
 }
 
-// ============ ENDPOINT IA PURO ============
+// ====== ENDPOINT IA PURO ======
 
 app.post("/lead/analyze", async (req, res) => {
   const body = req.body || {};
-
   const text =
     body.text || body.mensaje || body.message || body.content || "";
 
@@ -271,7 +261,6 @@ app.post("/lead/analyze", async (req, res) => {
 
 // ============ ODOO JSON-RPC ============
 
-// Autenticar contra Odoo y obtener uid
 async function authenticateOdoo() {
   if (cachedOdooUid) {
     return cachedOdooUid;
@@ -316,7 +305,6 @@ async function authenticateOdoo() {
   return uid;
 }
 
-// Crear lead en Odoo
 async function createOdooLead(ai, originalBody) {
   const uid = await authenticateOdoo();
 
@@ -362,11 +350,11 @@ Datos detectados: ${JSON.stringify(ai.datos_detectados || {})}
 Origen: ${origin}
 Canal: ${channel}
     `.trim(),
-    x_intencion_ai: ai.intencion, // si luego creas campos x_intencion_ai, x_pais_ai, etc.
+    // Estos campos x_* solo tendrán efecto si luego los creamos en Odoo.
+    x_intencion_ai: ai.intencion,
     x_pais_ai: ai.pais,
     x_idioma_ai: ai.idioma,
     x_urgencia_ai: ai.urgencia,
-    // puedes añadir más campos personalizados aquí si ya existen en tu modelo
   };
 
   const url = `${ODOO_BASE_URL}/jsonrpc`;
@@ -395,8 +383,19 @@ Canal: ${channel}
 
   const data = await resp.json();
 
-  if (!data.result) {
-    throw new Error("Odoo no devolvió ID de lead");
+  // 🔍 Nueva parte: mostrar el error real de Odoo si lo hay
+  if (data.error) {
+    console.error("[Odoo create lead] error:", JSON.stringify(data.error));
+    const msg =
+      (data.error.data && data.error.data.message) ||
+      data.error.message ||
+      JSON.stringify(data.error);
+    throw new Error(`Odoo error creando lead: ${msg}`);
+  }
+
+  if (typeof data.result !== "number") {
+    console.error("[Odoo create lead] respuesta sin result numérico:", data);
+    throw new Error("Odoo no devolvió un ID numérico de lead");
   }
 
   return data.result; // id del lead
@@ -406,7 +405,6 @@ Canal: ${channel}
 
 app.post("/lead/analyze-and-create", async (req, res) => {
   const body = req.body || {};
-
   const text =
     body.text || body.mensaje || body.message || body.content || "";
 
@@ -434,7 +432,6 @@ app.post("/lead/analyze-and-create", async (req, res) => {
     const parsed = await callDeepSeekJSON(systemPrompt, userPrompt);
     const normalized = normalizeAIResult(parsed);
 
-    // crear lead en Odoo
     const leadId = await createOdooLead(normalized, body);
 
     return res.json({
