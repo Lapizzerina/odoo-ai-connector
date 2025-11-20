@@ -1,6 +1,6 @@
 // index.js
 // Servicio IA sencillo para analizar LEADS de Odoo
-// Lo desplegaremos en Render como Web Service
+// Ahora usando DeepSeek en lugar de OpenAI
 
 require('dotenv').config();
 const express = require('express');
@@ -12,7 +12,7 @@ const app = express();
 
 // -------- Config básica --------
 const PORT = process.env.PORT || 10000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
 const SECURITY_TOKEN = process.env.SECURITY_TOKEN || 'CAMBIA_ESTO';
 
 // Middlewares
@@ -34,10 +34,10 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'odoo-ai-connector', uptime: process.uptime() });
 });
 
-// --------- Helper IA ----------
+// --------- Helper IA (DeepSeek) ----------
 async function analyzeLeadWithAI(payload) {
-  if (!OPENAI_API_KEY) {
-    throw new Error('Falta OPENAI_API_KEY en variables de entorno');
+  if (!DEEPSEEK_API_KEY) {
+    throw new Error('Falta DEEPSEEK_API_KEY en variables de entorno');
   }
 
   const {
@@ -89,18 +89,19 @@ Devuelve SOLO un JSON con esta estructura:
   `;
 
   const response = await axios.post(
-    'https://api.openai.com/v1/chat/completions',
+    'https://api.deepseek.com/chat/completions',
     {
-      model: 'gpt-4o-mini', // puedes cambiar a otro modelo si quieres
+      model: 'deepseek-chat',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.4,
+      stream: false,
     },
     {
       headers: {
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
         'Content-Type': 'application/json',
       },
       timeout: 20000,
@@ -114,7 +115,7 @@ Devuelve SOLO un JSON con esta estructura:
   try {
     parsed = JSON.parse(content);
   } catch (err) {
-    console.error('Error parseando JSON de OpenAI:', err);
+    console.error('Error parseando JSON de DeepSeek:', err);
     // Fallback mínimo para no romper Odoo
     parsed = {
       status: 'pendiente',
@@ -166,7 +167,7 @@ app.post('/lead/analyze', async (req, res) => {
       ai: aiResult,
     });
   } catch (err) {
-    console.error('Error en /lead/analyze:', err);
+    console.error('Error en /lead/analyze:', err?.response?.data || err.message || err);
     return res.status(500).json({
       ok: false,
       error: 'INTERNAL_ERROR',
@@ -198,7 +199,7 @@ app.get('/debug/demo-lead', async (req, res) => {
       ai: aiResult,
     });
   } catch (err) {
-    console.error('Error en /debug/demo-lead:', err);
+    console.error('Error en /debug/demo-lead:', err?.response?.data || err.message || err);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
