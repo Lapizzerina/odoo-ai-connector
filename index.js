@@ -1,4 +1,4 @@
-// index.js — odoo-ai-connector + DeepSeek
+// index.js — odoo-ai-connector + DeepSeek + Odoo
 // Node 18+ (Render) — usa fetch nativo
 
 const express = require("express");
@@ -6,26 +6,32 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.1.1";
+const VERSION = "v1.2.0";
 
-// ⚙️ Configuración básica
+// ========= CONFIG ODOO =========
+const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
+const ODOO_DB = process.env.ODOO_DB;             // ej: piznalia1
+const ODOO_USER_EMAIL = process.env.ODOO_USER_EMAIL;
+const ODOO_API_KEY = process.env.ODOO_API_KEY;
+
+// cache simple de uid
+let cachedOdooUid = null;
+
+// ⚙️ Config básica
 app.use(
   express.json({
     limit: "1mb",
   })
 );
 
-// Middleware CORS sencillo (sin librerías externas)
+// CORS básico
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header(
     "Access-Control-Allow-Headers",
     "Origin, X-Requested-With, Content-Type, Accept"
   );
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET, POST, OPTIONS"
-  );
+  res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
   }
@@ -42,7 +48,9 @@ app.get("/health", (req, res) => {
   });
 });
 
-// 🧠 Prompt de sistema para DeepSeek (JSON estricto)
+// ============ IA (DeepSeek) ============
+
+// Prompt de sistema para DeepSeek
 function buildSystemPrompt() {
   return `
 Eres un analizador automático de leads para la empresa Piznalia / La Pizzerina / SmartChef24h.
@@ -54,11 +62,11 @@ EJEMPLO DE JSON DESEADO:
   "idioma": "es",
   "pais": "España",
   "urgencia": "alta",
-  "resumen": "Quiere información para comprar una máquina en Barcelona",
-  "pregunta": "¿Qué precio tiene la máquina y cómo funciona el servicio?",
+  "resumen": "Quiere información para comprar una máquina SmartChef24h para su bar en Sevilla",
+  "pregunta": "¿Qué precio tiene la máquina y cuáles son las condiciones?",
   "datos_detectados": {
     "cantidad": "1 máquina",
-    "ubicacion": "Barcelona",
+    "ubicacion": "Sevilla",
     "plazo": "próximos meses"
   }
 }
@@ -76,8 +84,8 @@ Reglas para el JSON de salida:
 - Devuelve SIEMPRE un único objeto JSON, sin texto antes ni después.
 - Campos obligatorios:
   - "intencion": una de las opciones indicadas.
-  - "idioma": "es", "ca", "en", "fr", "pt" (elige el idioma principal del mensaje).
-  - "pais": nombre normalizado: España, Portugal, Francia, Andorra, Chile, México, Argentina, etc.
+  - "idioma": "es", "ca", "en", "fr", "pt".
+  - "pais": nombre normalizado (España, Portugal, Francia, Andorra, Chile, México, Argentina, etc.).
     - Si no se puede saber, pon "Desconocido".
   - "urgencia": "alta", "media" o "baja".
   - "resumen": frase breve con lo que quiere el cliente.
@@ -91,7 +99,7 @@ Reglas para el JSON de salida:
 `;
 }
 
-// 🧾 Prompt de usuario: mensaje + meta
+// Prompt de usuario: mensaje + meta
 function buildUserPrompt(text, meta) {
   const origen = meta?.origen || meta?.source || "";
   const canal = meta?.canal || meta?.channel || "";
@@ -111,7 +119,7 @@ function buildUserPrompt(text, meta) {
   return contexto;
 }
 
-// 🧠 Llamada a DeepSeek
+// Llamada a DeepSeek
 async function callDeepSeekJSON(systemPrompt, userPrompt) {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
@@ -169,7 +177,7 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
   return parsed;
 }
 
-// 🧩 Normalizar salida para que Odoo la use fácil
+// Normalizar salida IA
 function normalizeAIResult(parsed) {
   const intencion = parsed.intencion || parsed.intent || "otros";
   const idioma = parsed.idioma || parsed.language || "es";
@@ -192,7 +200,8 @@ function normalizeAIResult(parsed) {
   };
 }
 
-// 📥 Endpoint principal: analizar lead
+// ============ ENDPOINT IA PURO ============
+
 app.post("/lead/analyze", async (req, res) => {
   const body = req.body || {};
 
@@ -256,6 +265,203 @@ app.post("/lead/analyze", async (req, res) => {
           "No se pudo analizar correctamente el lead con IA.",
         motivo: isParseError ? "error_parseo" : err.message,
       },
+    });
+  }
+});
+
+// ============ ODOO JSON-RPC ============
+
+// Autenticar contra Odoo y obtener uid
+async function authenticateOdoo() {
+  if (cachedOdooUid) {
+    return cachedOdooUid;
+  }
+
+  if (!ODOO_BASE_URL || !ODOO_DB || !ODOO_USER_EMAIL || !ODOO_API_KEY) {
+    throw new Error("Faltan variables Odoo (BASE_URL, DB, USER_EMAIL, API_KEY)");
+  }
+
+  const url = `${ODOO_BASE_URL}/jsonrpc`;
+
+  const body = {
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "common",
+      method: "authenticate",
+      args: [ODOO_DB, ODOO_USER_EMAIL, ODOO_API_KEY, {}],
+    },
+    id: 1,
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Error autenticando en Odoo: HTTP ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+  const uid = data.result;
+
+  if (!uid) {
+    throw new Error("Autenticación Odoo fallida (uid vacío)");
+  }
+
+  cachedOdooUid = uid;
+  return uid;
+}
+
+// Crear lead en Odoo
+async function createOdooLead(ai, originalBody) {
+  const uid = await authenticateOdoo();
+
+  const partnerName =
+    originalBody.nombre ||
+    originalBody.name ||
+    originalBody.contact_name ||
+    "Lead sin nombre";
+
+  const emailFrom = originalBody.email || originalBody.email_from || "";
+  const phone = originalBody.phone || originalBody.telefono || "";
+
+  const origin = originalBody.origen || originalBody.source || "";
+  const channel = originalBody.canal || originalBody.channel || "";
+
+  const textoOriginal =
+    originalBody.text ||
+    originalBody.mensaje ||
+    originalBody.message ||
+    originalBody.content ||
+    "";
+
+  const vals = {
+    name: ai.resumen || ai.pregunta || "Nuevo lead desde IA",
+    contact_name: partnerName,
+    email_from: emailFrom,
+    phone: phone,
+    description: `
+Texto original:
+${textoOriginal}
+
+Resumen IA:
+${ai.resumen || ""}
+
+Pregunta:
+${ai.pregunta || ""}
+
+Intención: ${ai.intencion}
+País: ${ai.pais}
+Urgencia: ${ai.urgencia}
+Datos detectados: ${JSON.stringify(ai.datos_detectados || {})}
+
+Origen: ${origin}
+Canal: ${channel}
+    `.trim(),
+    x_intencion_ai: ai.intencion, // si luego creas campos x_intencion_ai, x_pais_ai, etc.
+    x_pais_ai: ai.pais,
+    x_idioma_ai: ai.idioma,
+    x_urgencia_ai: ai.urgencia,
+    // puedes añadir más campos personalizados aquí si ya existen en tu modelo
+  };
+
+  const url = `${ODOO_BASE_URL}/jsonrpc`;
+
+  const body = {
+    jsonrpc: "2.0",
+    method: "call",
+    params: {
+      service: "object",
+      method: "execute_kw",
+      args: [ODOO_DB, uid, ODOO_API_KEY, "crm.lead", "create", [vals]],
+    },
+    id: 2,
+  };
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Error creando lead en Odoo: HTTP ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+
+  if (!data.result) {
+    throw new Error("Odoo no devolvió ID de lead");
+  }
+
+  return data.result; // id del lead
+}
+
+// ============ ENDPOINT IA + CREACIÓN LEAD ============
+
+app.post("/lead/analyze-and-create", async (req, res) => {
+  const body = req.body || {};
+
+  const text =
+    body.text || body.mensaje || body.message || body.content || "";
+
+  if (!text || !String(text).trim()) {
+    return res.status(400).json({
+      ok: false,
+      service: SERVICE_NAME,
+      error: "missing_text",
+      message:
+        "Debes enviar al menos un campo 'text', 'mensaje' o 'message' con contenido.",
+    });
+  }
+
+  const meta = {
+    origen: body.origen || body.source,
+    canal: body.canal || body.channel,
+    nombre: body.nombre || body.name,
+    email: body.email,
+  };
+
+  const systemPrompt = buildSystemPrompt();
+  const userPrompt = buildUserPrompt(String(text), meta);
+
+  try {
+    const parsed = await callDeepSeekJSON(systemPrompt, userPrompt);
+    const normalized = normalizeAIResult(parsed);
+
+    // crear lead en Odoo
+    const leadId = await createOdooLead(normalized, body);
+
+    return res.json({
+      ok: true,
+      service: SERVICE_NAME,
+      demo: false,
+      lead_id: leadId,
+      ai: {
+        status: "ok",
+        resumen: normalized.resumen,
+        respuesta: normalized.raw,
+        motivo: null,
+        intencion: normalized.intencion,
+        idioma: normalized.idioma,
+        pais: normalized.pais,
+        urgencia: normalized.urgencia,
+        pregunta: normalized.pregunta,
+        datos_detectados: normalized.datos_detectados,
+      },
+    });
+  } catch (err) {
+    console.error("[/lead/analyze-and-create] Error:", err.message);
+    return res.status(500).json({
+      ok: false,
+      service: SERVICE_NAME,
+      error: "odoo_or_ai_error",
+      message: err.message,
     });
   }
 });
