@@ -1,4 +1,4 @@
-// index.js — odoo-ai-connector + Gemini + Odoo + Zadarma (webhook llamadas)
+// index.js — odoo-ai-connector + Gemini + Odoo + Zadarma (webhook base)
 // Node 18+ (Render) — usa fetch nativo
 
 const express = require("express");
@@ -16,15 +16,14 @@ const ODOO_API_KEY = process.env.ODOO_API_KEY;
 const ODOO_APPOINTMENT_URL = process.env.ODOO_APPOINTMENT_URL || "";
 
 // ========= CONFIG GEMINI =========
-// Debes tener al menos GEMINI_API_KEY definida en Render.
-// Opcionalmente puedes definir GEMINI_MODEL (por defecto gemini-1.5-flash).
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+// Puedes sobreescribir el modelo con GEMINI_MODEL en Render si quieres
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
-// cache simple de uid Odoo
+// cache simple de uid
 let cachedOdooUid = null;
 
-// ⚙️ Config básica Express
+// ⚙️ Config básica
 app.use(
   express.json({
     limit: "1mb",
@@ -55,9 +54,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* =====================================================================
- *  IA CON GEMINI — CONFIG PROMPTS
- * ===================================================================== */
+// ============ PROMPTS IA ============
 
 function buildSystemPrompt() {
   return `
@@ -125,44 +122,33 @@ function buildUserPrompt(text, meta) {
   return contexto;
 }
 
-/* =====================================================================
- *  LLAMADA A GEMINI v1 (REST) PARA OBTENER JSON
- * ===================================================================== */
+// ============ IA (Gemini) ============
 
 async function callGeminiJSON(systemPrompt, userPrompt) {
   if (!GEMINI_API_KEY) {
     throw new Error("Falta la variable de entorno GEMINI_API_KEY");
   }
 
-  const model = GEMINI_MODEL;
+  const modelId = encodeURIComponent(GEMINI_MODEL);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent`;
 
-  // Endpoint oficial Gemini API v1 — generateContent
-  // https://generativelanguage.googleapis.com/v1/models/{model}:generateContent
-  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent`;
-
-  // Combinamos system + user en un único contenido para evitar campos no soportados
-  const combinedPrompt = `${systemPrompt}\n\n-----\n\n${userPrompt}`;
+  // Para evitar campos no soportados, metemos el systemPrompt dentro del texto
+  const fullPrompt = `${systemPrompt}\n\n---\n\n${userPrompt}`;
 
   const body = {
     contents: [
       {
         role: "user",
-        parts: [{ text: combinedPrompt }],
+        parts: [{ text: fullPrompt }],
       },
     ],
-    generationConfig: {
-      temperature: 0.1,
-      maxOutputTokens: 512,
-      // No usamos JSON mode obligatorio; confiamos en el prompt
-      // para mantener el formato JSON simple y luego hacemos JSON.parse.
-    },
   };
 
   const resp = await fetch(url, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json",
       "x-goog-api-key": GEMINI_API_KEY,
+      "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
   });
@@ -175,21 +161,21 @@ async function callGeminiJSON(systemPrompt, userPrompt) {
 
   const data = await resp.json();
 
-  // Estructura de respuesta v1:
-  // { candidates: [ { content: { parts: [ { text: "..." } ] } } ] }
-  const content =
-    data?.candidates?.[0]?.content?.parts?.[0]?.text &&
-    String(data.candidates[0].content.parts[0].text).trim();
+  const text =
+    data?.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text || "")
+      .join("")
+      .trim() || "";
 
-  if (!content) {
+  if (!text) {
     throw new Error("Gemini devolvió contenido vacío");
   }
 
   let parsed;
   try {
-    parsed = JSON.parse(content);
+    parsed = JSON.parse(text);
   } catch (e) {
-    console.error("[Gemini] Error parseando JSON:", e.message, content);
+    console.error("[Gemini] Error parseando JSON:", e.message, text);
     throw new Error("error_parseo_json");
   }
 
@@ -217,9 +203,7 @@ function normalizeAIResult(parsed) {
   };
 }
 
-/* =====================================================================
- *  ENDPOINT IA PURO
- * ===================================================================== */
+// ====== ENDPOINT IA PURO ======
 
 app.post("/lead/analyze", async (req, res) => {
   const body = req.body || {};
@@ -279,16 +263,15 @@ app.post("/lead/analyze", async (req, res) => {
       ai: {
         status: "pendiente",
         respuesta: "",
-        resumen: "No se pudo analizar correctamente el lead con IA.",
+        resumen:
+          "No se pudo analizar correctamente el lead con IA.",
         motivo: isParseError ? "error_parseo" : err.message,
       },
     });
   }
 });
 
-/* =====================================================================
- *  ODOO JSON-RPC
- * ===================================================================== */
+// ============ ODOO JSON-RPC ============
 
 async function authenticateOdoo() {
   if (cachedOdooUid) {
@@ -296,9 +279,7 @@ async function authenticateOdoo() {
   }
 
   if (!ODOO_BASE_URL || !ODOO_DB || !ODOO_USER_EMAIL || !ODOO_API_KEY) {
-    throw new Error(
-      "Faltan variables Odoo (BASE_URL, DB, USER_EMAIL, API_KEY)"
-    );
+    throw new Error("Faltan variables Odoo (BASE_URL, DB, USER_EMAIL, API_KEY)");
   }
 
   const url = `${ODOO_BASE_URL}/jsonrpc`;
@@ -322,9 +303,7 @@ async function authenticateOdoo() {
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(
-      `Error autenticando en Odoo: HTTP ${resp.status} ${text}`
-    );
+    throw new Error(`Error autenticando en Odoo: HTTP ${resp.status} ${text}`);
   }
 
   const data = await resp.json();
@@ -478,23 +457,17 @@ function buildTagNames(ai, originalBody) {
   else if (urg === "baja") tagNames.push("Urgencia: baja");
 
   // Origen
-  const origen =
-    (originalBody.origen || originalBody.source || "").toLowerCase();
+  const origen = (originalBody.origen || originalBody.source || "").toLowerCase();
   if (origen === "web") tagNames.push("Origen: web");
   else if (origen === "email") tagNames.push("Origen: email");
   else if (origen === "telefono" || origen === "teléfono")
     tagNames.push("Origen: teléfono");
-  else if (
-    origen === "red_social" ||
-    origen === "redes" ||
-    origen === "social"
-  )
+  else if (origen === "red_social" || origen === "redes" || origen === "social")
     tagNames.push("Origen: redes sociales");
   else if (origen === "cita") tagNames.push("Origen: cita");
 
   // Canal
-  const canal =
-    (originalBody.canal || originalBody.channel || "").toLowerCase();
+  const canal = (originalBody.canal || originalBody.channel || "").toLowerCase();
   if (canal === "formulario") tagNames.push("Canal: formulario");
   else if (canal === "llamada") tagNames.push("Canal: llamada");
   else if (canal === "whatsapp") tagNames.push("Canal: WhatsApp");
@@ -544,11 +517,7 @@ function buildSuggestedReply(ai, originalBody) {
   if (!isSpanish) {
     // Versión muy simple en inglés
     let msg = `${baseNombre} thank you for contacting us.\n\n`;
-    if (
-      intencion === "maquina" ||
-      intencion === "operador" ||
-      intencion === "ambos"
-    ) {
+    if (intencion === "maquina" || intencion === "operador" || intencion === "ambos") {
       msg +=
         "We will send you information about our vending machines (SmartChef24h) and commercial conditions.\n";
     } else if (intencion === "pizzas") {
@@ -574,11 +543,7 @@ function buildSuggestedReply(ai, originalBody) {
   // Versión española
   let msg = `${baseNombre} gracias por contactar con Piznalia / La Pizzerina.\n\n`;
 
-  if (
-    intencion === "maquina" ||
-    intencion === "operador" ||
-    intencion === "ambos"
-  ) {
+  if (intencion === "maquina" || intencion === "operador" || intencion === "ambos") {
     msg +=
       "Hemos recibido tu consulta sobre nuestras máquinas SmartChef24h y las condiciones para instalarlas";
     if (ubicacion) {
@@ -729,9 +694,7 @@ Canal: ${channel}
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(
-      `Error creando lead en Odoo: HTTP ${resp.status} ${text}`
-    );
+    throw new Error(`Error creando lead en Odoo: HTTP ${resp.status} ${text}`);
   }
 
   const data = await resp.json();
@@ -746,19 +709,14 @@ Canal: ${channel}
   }
 
   if (typeof data.result !== "number") {
-    console.error(
-      "[Odoo create lead] respuesta sin result numérico:",
-      data
-    );
+    console.error("[Odoo create lead] respuesta sin result numérico:", data);
     throw new Error("Odoo no devolvió un ID numérico de lead");
   }
 
   return data.result;
 }
 
-/* =====================================================================
- *  ENDPOINT IA + CREACIÓN LEAD
- * ===================================================================== */
+// ============ ENDPOINT IA + CREACIÓN LEAD ============
 
 app.post("/lead/analyze-and-create", async (req, res) => {
   const body = req.body || {};
@@ -820,53 +778,53 @@ app.post("/lead/analyze-and-create", async (req, res) => {
   }
 });
 
-/* =====================================================================
- *  WEBHOOK ZADARMA — TRANSCRIPCIÓN DE LLAMADAS
- * ===================================================================== */
+// ============ WEBHOOK ZADARMA (llamada → transcripción → lead) ============
 
 app.post("/webhooks/zadarma/call", async (req, res) => {
   const body = req.body || {};
+  const transcript =
+    body.transcript ||
+    body.text ||
+    body.mensaje ||
+    body.message ||
+    "";
 
-  const transcript = String(body.transcript || "").trim();
-  const callerName = body.caller_name || body.callerName || "";
-  const callerId = body.caller_id || body.callerId || "";
-
-  if (!transcript) {
+  if (!transcript || !String(transcript).trim()) {
     return res.status(400).json({
       ok: false,
       service: SERVICE_NAME,
       source: "zadarma",
       error: "missing_transcript",
       message:
-        "Debes enviar un campo 'transcript' con el texto de la llamada.",
+        "Debes enviar un campo 'transcript' (o 'text'/'mensaje') con la transcripción de la llamada.",
     });
   }
 
-  // Reutilizamos el mismo flujo de IA + creación de lead
-  const meta = {
+  // Forzamos origen / canal telefónico
+  const enrichedBody = {
+    ...body,
+    text: transcript,
     origen: "telefono",
     canal: "llamada",
-    nombre: callerName,
-    // no conocemos email en llamadas entrantes
+    nombre: body.caller_name || body.nombre || body.name,
+    phone: body.caller_id || body.phone || body.telefono,
+  };
+
+  const meta = {
+    origen: enrichedBody.origen,
+    canal: enrichedBody.canal,
+    nombre: enrichedBody.nombre,
+    email: enrichedBody.email,
   };
 
   const systemPrompt = buildSystemPrompt();
-  const userPrompt = buildUserPrompt(transcript, meta);
+  const userPrompt = buildUserPrompt(String(transcript), meta);
 
   try {
     const parsed = await callGeminiJSON(systemPrompt, userPrompt);
     const normalized = normalizeAIResult(parsed);
 
-    // Construimos un cuerpo "tipo lead" para que createOdooLead meta bien los campos
-    const leadBody = {
-      text: transcript,
-      nombre: callerName || "Llamada entrante",
-      phone: callerId || "",
-      origen: "telefono",
-      canal: "llamada",
-    };
-
-    const leadId = await createOdooLead(normalized, leadBody);
+    const leadId = await createOdooLead(normalized, enrichedBody);
 
     return res.json({
       ok: true,
@@ -898,10 +856,7 @@ app.post("/webhooks/zadarma/call", async (req, res) => {
   }
 });
 
-/* =====================================================================
- *  ROOT
- * ===================================================================== */
-
+// 🌍 Fallback root
 app.get("/", (req, res) => {
   return res.json({
     ok: true,
@@ -913,5 +868,7 @@ app.get("/", (req, res) => {
 // 🚀 Arranque
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${SERVICE_NAME}] v${VERSION} escuchando en puerto ${PORT}`);
+  console.log(
+    `[${SERVICE_NAME}] v${VERSION} escuchando en puerto ${PORT}`
+  );
 });
