@@ -153,8 +153,7 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
       temperature: 0.1,
       maxOutputTokens: 512,
     },
-    response_mime_type: "application/json",
-  };
+      };
 
   const resp = await fetch(url, {
     method: "POST",
