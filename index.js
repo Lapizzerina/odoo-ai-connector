@@ -1,4 +1,4 @@
-// index.js — odoo-ai-connector + DeepSeek + Odoo
+// index.js — odoo-ai-connector + Gemini + Odoo
 // Node 18+ (Render) — usa fetch nativo
 
 const express = require("express");
@@ -6,7 +6,7 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.3.1";
+const VERSION = "v1.4.0";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
@@ -14,6 +14,16 @@ const ODOO_DB = process.env.ODOO_DB;             // ej: piznalia1
 const ODOO_USER_EMAIL = process.env.ODOO_USER_EMAIL;
 const ODOO_API_KEY = process.env.ODOO_API_KEY;
 const ODOO_APPOINTMENT_URL = process.env.ODOO_APPOINTMENT_URL || "";
+
+// ⚙️ CONFIG GEMINI =========
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+
+if (!GEMINI_API_KEY) {
+  console.warn(
+    "[WARN] No se ha definido GEMINI_API_KEY. Las llamadas IA fallarán hasta que la configures."
+  );
+}
 
 // cache simple de uid
 let cachedOdooUid = null;
@@ -49,7 +59,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ============ IA (DeepSeek) ============
+// ============ IA (ANTES DeepSeek, AHORA GEMINI) ============
 
 function buildSystemPrompt() {
   return `
@@ -117,31 +127,40 @@ function buildUserPrompt(text, meta) {
   return contexto;
 }
 
+/**
+ * Antes llamaba a DeepSeek. Ahora usamos Gemini 1.5 Flash,
+ * pero mantenemos el mismo nombre de función para no cambiar nada más.
+ */
 async function callDeepSeekJSON(systemPrompt, userPrompt) {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  const model = process.env.DEEPSEEK_MODEL || "deepseek-chat";
-
-  if (!apiKey) {
-    throw new Error("Falta la variable de entorno DEEPSEEK_API_KEY");
+  if (!GEMINI_API_KEY) {
+    throw new Error("Falta la variable de entorno GEMINI_API_KEY");
   }
 
-  const url = "https://api.deepseek.com/chat/completions";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
   const body = {
-    model,
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
+    // Prompt de sistema separado
+    system_instruction: {
+      role: "system",
+      parts: [{ text: systemPrompt }],
+    },
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: userPrompt }],
+      },
     ],
-    temperature: 0.1,
-    max_tokens: 512,
-    response_format: { type: "json_object" },
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 512,
+    },
+    // Muy importante: pedir SOLO JSON
+    response_mime_type: "application/json",
   };
 
   const resp = await fetch(url, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
@@ -149,25 +168,26 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
 
   if (!resp.ok) {
     const errorText = await resp.text().catch(() => "");
-    const msg = `Error DeepSeek HTTP ${resp.status}: ${errorText}`;
+    const msg = `Error Gemini HTTP ${resp.status}: ${errorText}`;
     throw new Error(msg);
   }
 
   const data = await resp.json();
 
+  // data.candidates[0].content.parts[0].text debe contener el JSON en string
   const content =
-    data?.choices?.[0]?.message?.content &&
-    String(data.choices[0].message.content).trim();
+    data?.candidates?.[0]?.content?.parts?.[0]?.text &&
+    String(data.candidates[0].content.parts[0].text).trim();
 
   if (!content) {
-    throw new Error("DeepSeek devolvió contenido vacío");
+    throw new Error("Gemini devolvió contenido vacío o en formato inesperado");
   }
 
   let parsed;
   try {
     parsed = JSON.parse(content);
   } catch (e) {
-    console.error("[DeepSeek] Error parseando JSON:", e.message, content);
+    console.error("[Gemini] Error parseando JSON:", e.message, content);
     throw new Error("error_parseo_json");
   }
 
