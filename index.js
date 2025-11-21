@@ -1,4 +1,4 @@
-// index.js — odoo-ai-connector + Gemini + Odoo
+// index.js — odoo-ai-connector + Gemini + Odoo + Zadarma (webhook base)
 // Node 18+ (Render) — usa fetch nativo
 
 const express = require("express");
@@ -6,7 +6,7 @@ const express = require("express");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.4.0";
+const VERSION = "v1.5.0";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = process.env.ODOO_BASE_URL; // ej: https://piznalia1.odoo.com
@@ -25,7 +25,7 @@ if (!GEMINI_API_KEY) {
   );
 }
 
-// cache simple de uid
+// cache simple de uid Odoo
 let cachedOdooUid = null;
 
 // ⚙️ Config básica
@@ -139,7 +139,6 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
   const body = {
-    // Prompt de sistema separado
     system_instruction: {
       role: "system",
       parts: [{ text: systemPrompt }],
@@ -154,7 +153,6 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
       temperature: 0.1,
       maxOutputTokens: 512,
     },
-    // Muy importante: pedir SOLO JSON
     response_mime_type: "application/json",
   };
 
@@ -174,7 +172,6 @@ async function callDeepSeekJSON(systemPrompt, userPrompt) {
 
   const data = await resp.json();
 
-  // data.candidates[0].content.parts[0].text debe contener el JSON en string
   const content =
     data?.candidates?.[0]?.content?.parts?.[0]?.text &&
     String(data.candidates[0].content.parts[0].text).trim();
@@ -675,14 +672,12 @@ Canal: ${channel}
     priority,
     city: city || undefined,
     country_id: countryId || undefined,
-    // Campos personalizados de IA (dejamos fuera x_estado_ia por tipo de campo)
     x_resumen_ia: ai.resumen || "",
     x_respuesta_ia: suggestedReply,
   };
 
   if (tagIds.length) {
-    // Many2many: set ids
-    vals.tag_ids = [[6, 0, tagIds]];
+    vals.tag_ids = [[6, 0, tagIds]]; // Many2many: set ids
   }
 
   const url = `${ODOO_BASE_URL}/jsonrpc`;
@@ -728,7 +723,7 @@ Canal: ${channel}
   return data.result;
 }
 
-// ============ ENDPOINT IA + CREACIÓN LEAD ============
+// ============ ENDPOINT IA + CREACIÓN LEAD (formularios, etc.) ============
 
 app.post("/lead/analyze-and-create", async (req, res) => {
   const body = req.body || {};
@@ -785,6 +780,104 @@ app.post("/lead/analyze-and-create", async (req, res) => {
       ok: false,
       service: SERVICE_NAME,
       error: "odoo_or_ai_error",
+      message: err.message,
+    });
+  }
+});
+
+// ============ ENDPOINT ZADARMA: LLAMADA → IA → LEAD ODOO ============
+
+app.post("/webhooks/zadarma/call", async (req, res) => {
+  const original = req.body || {};
+
+  // Intentamos encontrar el texto de la llamada en varios campos posibles
+  const text =
+    original.text ||
+    original.transcript ||
+    original.transcription ||
+    original.speech_text ||
+    original.notes ||
+    original.comment ||
+    "";
+
+  if (!text || !String(text).trim()) {
+    console.warn("[/webhooks/zadarma/call] Llamada sin texto/transcripción útil");
+    // Para Zadarma es mejor devolver 200 aunque no hagamos nada,
+    // para que no reintente en bucle.
+    return res.status(200).json({
+      ok: false,
+      service: SERVICE_NAME,
+      source: "zadarma",
+      error: "missing_transcript",
+      message:
+        "No se encontró texto de transcripción en los campos esperados (text/transcript/transcription/speech_text/notes/comment).",
+    });
+  }
+
+  // Normalizamos algunos campos para que createOdooLead los use bien
+  const body = {
+    ...original,
+    text,
+    origen: original.origen || original.source || "telefono",
+    canal: original.canal || original.channel || "llamada",
+    nombre:
+      original.nombre ||
+      original.name ||
+      original.caller_name ||
+      original.callerid_name ||
+      "",
+    phone:
+      original.phone ||
+      original.telefono ||
+      original.caller ||
+      original.caller_number ||
+      original.caller_id ||
+      original.callerid ||
+      "",
+  };
+
+  const meta = {
+    origen: body.origen,
+    canal: body.canal,
+    nombre: body.nombre,
+    email: body.email,
+  };
+
+  const systemPrompt = buildSystemPrompt();
+  const userPrompt = buildUserPrompt(String(text), meta);
+
+  try {
+    const parsed = await callDeepSeekJSON(systemPrompt, userPrompt);
+    const normalized = normalizeAIResult(parsed);
+
+    const leadId = await createOdooLead(normalized, body);
+
+    return res.json({
+      ok: true,
+      service: SERVICE_NAME,
+      source: "zadarma",
+      lead_id: leadId,
+      ai: {
+        status: "ok",
+        resumen: normalized.resumen,
+        respuesta: normalized.raw,
+        motivo: null,
+        intencion: normalized.intencion,
+        idioma: normalized.idioma,
+        pais: normalized.pais,
+        urgencia: normalized.urgencia,
+        pregunta: normalized.pregunta,
+        datos_detectados: normalized.datos_detectados,
+      },
+    });
+  } catch (err) {
+    console.error("[/webhooks/zadarma/call] Error:", err.message);
+    // Devolvemos 200 igualmente para evitar reintentos agresivos
+    return res.status(200).json({
+      ok: false,
+      service: SERVICE_NAME,
+      source: "zadarma",
+      error: "zadarma_ai_or_odoo_error",
       message: err.message,
     });
   }
