@@ -19,7 +19,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.0.2";
+const VERSION      = "v3.1.1";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL          = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -131,11 +131,16 @@ async function transcribeAudioUrl(audioUrl) {
 //  ZADARMA API — firma HMAC + obtener URL grabación
 // ════════════════════════════════════════════════════════════════════════════
 function zadarmaSign(method, params, secret) {
-  const sortedKeys = Object.keys(params).sort();
-  const rfc1738    = s => encodeURIComponent(String(s)).replace(/%20/g, "+");
-  const paramsStr  = sortedKeys.map(k => `${rfc1738(k)}=${rfc1738(params[k])}`).join("&");
-  const md5str     = crypto.createHash("md5").update(paramsStr).digest("hex");
-  const toSign     = method + paramsStr + md5str;
+  // Implementación EXACTA del PHP oficial de Zadarma (Client.php):
+  // $paramsString = http_build_query($params);  ← SIN ordenar
+  // $sign = base64_encode(hash_hmac('sha1', $method.$paramsString.md5($paramsString), $secret));
+  const paramsStr = Object.keys(params)
+    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(String(params[k]))}`)
+    .join("&");
+  const md5str  = crypto.createHash("md5").update(paramsStr).digest("hex");
+  const toSign  = method + paramsStr + md5str;
+  console.log("[Zadarma Sign] paramsStr:", paramsStr);
+  console.log("[Zadarma Sign] toSign:", toSign.slice(0, 120));
   return crypto.createHmac("sha1", secret).update(toSign).digest("base64");
 }
 
@@ -143,10 +148,11 @@ async function getZadarmaRecordingUrl(callIdWithRec) {
   if (!ZADARMA_API_KEY || !ZADARMA_API_SECRET) throw new Error("Faltan claves Zadarma");
 
   const method = "/v1/pbx/record/request/";
+  // Orden exacto igual que el paramsStr de la firma
   const params = { call_id_with_rec: String(callIdWithRec), lifetime: "180" };
   const sign   = zadarmaSign(method, params, ZADARMA_API_SECRET);
 
-  const qs  = Object.keys(params).sort().map(k => `${k}=${encodeURIComponent(params[k])}`).join("&");
+  const qs  = Object.keys(params).map(k => `${k}=${encodeURIComponent(params[k])}`).join("&");
   const url = `https://api.zadarma.com${method}?${qs}`;
 
   console.log("[Zadarma API] GET", url);
@@ -293,7 +299,7 @@ async function findOrCreatePartner(uid, { name, phone, email }) {
 
   if (digits) {
     const ids = await odooExec(uid, "res.partner", "search",
-      [["|", ["phone", "ilike", digits], ["mobile", "ilike", digits]]], { limit: 1 }, 10);
+      [[["phone", "ilike", digits]]], { limit: 1 }, 10);
     partnerId = ids?.[0] || null;
   }
 
@@ -336,6 +342,31 @@ function urgencyToPriority(urg) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  HELPERS — asunto normalizado para leads y tickets
+// ════════════════════════════════════════════════════════════════════════════
+
+function buildLeadName(ai, callerName, callerPhone) {
+  const quien = callerName || callerPhone || "Desconocido";
+  const temaMap = {
+    venta_maquina:    "Comercial - Maquina pizza",
+    venta_pizza:      "Comercial - Pizzas",
+    operador_vending: "Comercial - Operador vending",
+    averia:           "SAT - Averia",
+    consulta_tecnica: "SAT - Consulta tecnica",
+    info_general:     "Info general",
+    otros:            "Otros",
+  };
+  const tema = temaMap[ai.categoria] || "Otros";
+  return `LLAMADA | ${quien} | ${tema}`;
+}
+
+function buildTicketName(ai, callerName, callerPhone) {
+  const quien = callerName || callerPhone || "Desconocido";
+  const resumen = ai.resumen ? ai.resumen.slice(0, 60) : "Incidencia";
+  return `[SAT LLAMADA] ${quien} - ${resumen}`;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  CREAR LEAD en crm.lead
 //  Campos reales confirmados del PDF:
 //    name, phone, email_from, partner_id, contact_name, description,
@@ -372,7 +403,7 @@ async function createLead(uid, ai, callerPhone, callerName, partnerId, extension
   ].filter(l => l !== null).join("\n").trim();
 
   const vals = {
-    name:          ai.resumen || `Llamada entrante ${callerPhone || ""}`.trim(),
+    name:          buildLeadName(ai, callerName, callerPhone),
     type:          "lead",
     phone:         callerPhone || undefined,
     contact_name:  callerName  || undefined,
@@ -424,7 +455,7 @@ async function createTicket(uid, ai, callerPhone, callerName, partnerId, machine
   ].join("\n").trim();
 
   const vals = {
-    name:          `[SAT] ${ai.resumen || "Incidencia " + (callerPhone || "")}`.trim(),
+    name:          buildTicketName(ai, callerName, callerPhone),
     partner_id:    partnerId || undefined,
     partner_phone: callerPhone || undefined,
     partner_name:  callerName  || undefined,
@@ -456,7 +487,7 @@ async function processCall({ transcript, callerPhone, callerName, extensionInfo,
   console.log(`[IA] resumen: ${ai.resumen}`);
 
   // 2. Buscar/crear contacto
-  const partnerId = await findOrCreatePartner(uid, {
+  const { partnerId, isNew } = await findOrCreatePartner(uid, {
     name:  callerName,
     phone: callerPhone,
     email: null,
@@ -467,19 +498,30 @@ async function processCall({ transcript, callerPhone, callerName, extensionInfo,
     const machines = partnerId ? await findMachinesByPartner(uid, partnerId) : [];
 
     if (machines.length > 0) {
-      // Tiene máquinas → crear ticket SAT
+      // Tiene máquinas → crear ticket SAT + nota en contacto
       const ticketId = await createTicket(uid, ai, callerPhone, callerName, partnerId, machines, extensionInfo, callId, transcript);
+      await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
       return { created: "ticket", id: ticketId, ai };
     } else {
-      // IA dice ticket pero no tiene máquina → crear lead con nota
-      console.log("[Lógica] IA detectó avería pero cliente sin máquina registrada → Lead");
+      // IA dice ticket pero sin máquina → lead + nota si contacto existente
+      console.log("[Lógica] IA detectó avería pero cliente sin máquina → Lead");
       ai.resumen = `[Sin máquina registrada] ${ai.resumen}`.trim();
+      if (!isNew) {
+        await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
+      }
       const leadId = await createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId, transcript);
       return { created: "lead", id: leadId, ai, note: "sin_maquina" };
     }
   }
 
-  // 4. Cualquier otro caso → lead
+  // 4. Contacto existente → solo nota en contacto, sin lead nuevo
+  if (!isNew && partnerId) {
+    await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
+    console.log(`[Lógica] Contacto existente → nota añadida, sin lead nuevo`);
+    return { created: "note", id: partnerId, ai };
+  }
+
+  // 5. Contacto nuevo → crear lead
   const leadId = await createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId, transcript);
   return { created: "lead", id: leadId, ai };
 }
@@ -582,9 +624,10 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
       // Fallback: crear lead básico para no perder la llamada
       try {
         const uid = await odooAuth();
-        const partnerId = callerPhone
+        const partnerResult = callerPhone
           ? await findOrCreatePartner(uid, { name: callerName, phone: callerPhone, email: null })
           : null;
+        const partnerId = partnerResult?.partnerId || null;
         const aiFallback = {
           tipo: "lead", categoria: "otros", interes: "Otros", sector: "Otros",
           urgencia: "media", resumen: `Llamada no procesada (error: ${err.message.slice(0, 80)})`,
