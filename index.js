@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.6.0";
+const VERSION      = "v3.6.1";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -556,13 +556,24 @@ function buildTicketName(ai, callerName, callerPhone) {
   return `[SAT LLAMADA] ${callerName||callerPhone||"Desconocido"} - ${(ai.resumen||"Incidencia").slice(0,60)}`;
 }
 
-async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId) {
+// Función genérica para añadir nota a cualquier modelo de Odoo
+async function postNoteToModel(uid, model, recordId, body) {
+  try {
+    await odooExec(uid, model, "message_post", [[recordId]], {
+      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
+    }, 56);
+    console.log(`[Odoo] Nota en ${model} #${recordId}`);
+  } catch (e) { console.warn(`[Odoo] Nota en ${model} fallida:`, e.message); }
+}
+
+// Construir texto de nota (reutilizable para contacto, lead y ticket)
+function buildNoteBody(ai, callerPhone, extensionInfo) {
   const catMap = {
     venta_maquina: "Venta máquina", venta_pizza: "Venta pizzas",
     operador_vending: "Operador vending", averia: "Avería",
     consulta_tecnica: "Consulta técnica", info_general: "Info general", otros: "Otros",
   };
-  const urgMap  = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
+  const urgMap   = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
   const accionMap = {
     agendar_visita: "📅 Agendar visita", confirmar_cita: "✅ Confirmar cita",
     enviar_info: "📧 Enviar información", enviar_presupuesto: "💶 Enviar presupuesto",
@@ -570,8 +581,7 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
     cerrar_ticket: "🔒 Cerrar ticket", ninguna: "—",
   };
   const c = ai.contacto || {};
-  const now = new Date();
-  const hora = now.toLocaleString("es-ES", {
+  const hora = new Date().toLocaleString("es-ES", {
     timeZone: "Europe/Madrid",
     day: "2-digit", month: "2-digit", year: "numeric",
     hour: "2-digit", minute: "2-digit"
@@ -584,15 +594,6 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
     `🤖 Resumen: ${ai.resumen||""}`,
   ];
 
-  if (ai.accion && ai.accion !== "ninguna") {
-    lines.push(``);
-    lines.push(`⚡ ACCIÓN: ${accionMap[ai.accion]||ai.accion}`);
-    if (ai.accion_detalle) lines.push(`   ${ai.accion_detalle}`);
-    if (ai.accion === "agendar_visita" && ODOO_APPOINTMENT_URL) {
-      lines.push(`   🔗 ${ODOO_APPOINTMENT_URL}`);
-    }
-  }
-
   if (ai.sintoma) {
     lines.push(``);
     lines.push(`🔧 Síntoma: ${ai.sintoma}`);
@@ -600,12 +601,12 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
   }
 
   const contactoData = [
-    c.nombre      ? `Nombre: ${c.nombre}`           : "",
-    c.empresa     ? `Empresa: ${c.empresa}`          : "",
-    c.email       ? `Email: ${c.email}`              : "",
-    c.direccion   ? `Dirección: ${c.direccion}`      : "",
-    c.fecha_visita? `Visita: ${c.fecha_visita}`      : "",
-    c.mac_digitos ? `Dígitos máquina: ${c.mac_digitos}` : "",
+    c.nombre       ? `Nombre: ${c.nombre}`              : "",
+    c.empresa      ? `Empresa: ${c.empresa}`             : "",
+    c.email        ? `Email: ${c.email}`                 : "",
+    c.direccion    ? `Dirección: ${c.direccion}`         : "",
+    c.fecha_visita ? `Visita: ${c.fecha_visita}`         : "",
+    c.mac_digitos  ? `Dígitos máquina: ${c.mac_digitos}` : "",
   ].filter(Boolean);
 
   if (contactoData.length > 0) {
@@ -614,17 +615,24 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
     contactoData.forEach(d => lines.push(`   ${d}`));
   }
 
+  if (ai.accion && ai.accion !== "ninguna") {
+    lines.push(``);
+    lines.push(`⚡ ACCIÓN: ${accionMap[ai.accion]||ai.accion}`);
+    if (ai.accion_detalle) lines.push(`   ${ai.accion_detalle}`);
+    if (ai.accion === "agendar_visita" && ODOO_APPOINTMENT_URL) {
+      lines.push(`   Agenda aquí: ${ODOO_APPOINTMENT_URL}`);
+    }
+  }
+
   lines.push(``);
-  lines.push(`Categoría: ${catMap[ai.categoria]||ai.categoria} | Urgencia: ${urgMap[ai.urgencia]||ai.urgencia}`);
+  lines.push(`Urgencia: ${urgMap[ai.urgencia]||ai.urgencia} | Categoría: ${catMap[ai.categoria]||ai.categoria}`);
 
-  const body = lines.join("\n");
+  return lines.join("\n");
+}
 
-  try {
-    await odooExec(uid, "res.partner", "message_post", [[partnerId]], {
-      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
-    }, 55);
-    console.log(`[Odoo] Nota en contacto #${partnerId}`);
-  } catch (e) { console.warn("[Odoo] Nota fallida:", e.message); }
+async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId) {
+  const body = buildNoteBody(ai, callerPhone, extensionInfo);
+  await postNoteToModel(uid, "res.partner", partnerId, body);
 }
 
 async function createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId) {
@@ -693,6 +701,11 @@ ${contactoLines2 ? `<p><strong>👤 Datos del cliente:</strong><br/>${contactoLi
   };
   const leadId = await odooExec(uid, "crm.lead", "create", [[vals]], {}, 50);
   console.log(`[Odoo] Lead #${leadId}: ${vals.name}`);
+
+  // Nota en chatter del lead
+  const noteBody = buildNoteBody(ai, callerPhone, extensionInfo);
+  await postNoteToModel(uid, "crm.lead", leadId, noteBody);
+
   return leadId;
 }
 
@@ -750,6 +763,11 @@ ${c.mac_digitos ? `<p><strong>🔢 Dígitos máquina mencionados:</strong> ${c.m
 
   const ticketId = await odooExec(uid, "helpdesk.ticket", "create", [[vals]], {}, 60);
   console.log(`[Odoo] Ticket #${ticketId}${machineUnique ? ` — ${machineUnique.x_name}` : ""}`);
+
+  // Nota en chatter del ticket
+  const ticketNote = buildNoteBody(ai, callerPhone, extensionInfo);
+  await postNoteToModel(uid, "helpdesk.ticket", ticketId, ticketNote);
+
   return ticketId;
 }
 
@@ -907,7 +925,23 @@ app.post("/test/nota", async (req, res) => {
   try {
     const uid  = await odooAuth();
     const horaTest = new Date().toLocaleString("es-ES", { timeZone: "Europe/Madrid", day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
-    const body = "<p><b>📞 LLAMADA RECIBIDA</b> — " + horaTest + "<br/>Tel: +34600000000 | Ext: ext. 200</p><p><b>🤖 Resumen:</b> Esta es una nota de prueba.</p><p><b>⚡ ACCIÓN:</b> 📅 Agendar visita<br/>Visita acordada para el martes 18 a las 10h<br/><a href=\"https://piznalia1.odoo.com/book/f3a63454\">📅 Abrir calendario</a></p><p><b>👤 Datos:</b><br/>Nombre: Juan García<br/>Empresa: Pizzería Roma<br/>Dirección: Granollers</p><p>Categoría: Venta máquina | Urgencia: 🟡 Media</p>";
+    const body = [
+      `📞 LLAMADA RECIBIDA — ${horaTest}`,
+      `Tel: +34600000000 | Ext: ext. 200`,
+      ``,
+      `🤖 Resumen: Esta es una nota de prueba.`,
+      ``,
+      `👤 Datos cliente:`,
+      `   Nombre: Juan García`,
+      `   Empresa: Pizzería Roma`,
+      `   Dirección: Granollers`,
+      ``,
+      `⚡ ACCIÓN: 📅 Agendar visita`,
+      `   Visita acordada para el martes 18 a las 10h`,
+      `   Agenda aquí: https://piznalia1.odoo.com/book/f3a63454`,
+      ``,
+      `Urgencia: 🟡 Media | Categoría: Venta máquina`,
+    ].join("\n");
     await odooExec(uid, "res.partner", "message_post", [[parseInt(partner_id)]], {
       body, message_type: "comment", subtype_xmlid: "mail.mt_note",
     }, 55);
