@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.5.9";
+const VERSION      = "v3.6.0";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -907,23 +907,7 @@ app.post("/test/nota", async (req, res) => {
   try {
     const uid  = await odooAuth();
     const horaTest = new Date().toLocaleString("es-ES", { timeZone: "Europe/Madrid", day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
-    const body = [
-      `📞 LLAMADA RECIBIDA — ${horaTest}`,
-      `Tel: +34600000000 | Ext: ext. 200`,
-      ``,
-      `🤖 Resumen: Esta es una nota de prueba.`,
-      ``,
-      `⚡ ACCIÓN: 📅 Agendar visita`,
-      `   Visita acordada para el martes 18 a las 10h`,
-      `   🔗 https://piznalia1.odoo.com/book/f3a63454`,
-      ``,
-      `👤 Datos cliente:`,
-      `   Nombre: Juan García`,
-      `   Empresa: Pizzería Roma`,
-      `   Dirección: Granollers`,
-      ``,
-      `Categoría: Venta máquina | Urgencia: 🟡 Media`,
-    ].join("\n");
+    const body = "<p><b>📞 LLAMADA RECIBIDA</b> — " + horaTest + "<br/>Tel: +34600000000 | Ext: ext. 200</p><p><b>🤖 Resumen:</b> Esta es una nota de prueba.</p><p><b>⚡ ACCIÓN:</b> 📅 Agendar visita<br/>Visita acordada para el martes 18 a las 10h<br/><a href=\"https://piznalia1.odoo.com/book/f3a63454\">📅 Abrir calendario</a></p><p><b>👤 Datos:</b><br/>Nombre: Juan García<br/>Empresa: Pizzería Roma<br/>Dirección: Granollers</p><p>Categoría: Venta máquina | Urgencia: 🟡 Media</p>";
     await odooExec(uid, "res.partner", "message_post", [[parseInt(partner_id)]], {
       body, message_type: "comment", subtype_xmlid: "mail.mt_note",
     }, 55);
