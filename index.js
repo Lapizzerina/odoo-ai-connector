@@ -189,13 +189,6 @@ Reglas:
 `.trim();
 }
 
-Reglas:
-- tipo="ticket" SOLO si el cliente describe claramente una avería o fallo técnico en una máquina
-- tipo="lead" en cualquier otro caso
-- No inventes datos. Si no puedes determinar algo → valor más genérico
-- RESPONDE SOLO CON JSON VÁLIDO
-`.trim();
-}
 
 function parseGeminiJSON(rawText) {
   const tryParse = s => { try { return JSON.parse(s); } catch { return null; } };
