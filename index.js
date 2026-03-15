@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.5.1";
+const VERSION      = "v3.5.5";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -170,12 +170,15 @@ Formato exacto:
   "idioma": "es | ca | en | fr | pt",
   "accion": "agendar_visita | confirmar_cita | enviar_info | enviar_presupuesto | llamar_cliente | esperar_cliente | cerrar_ticket | ninguna",
   "accion_detalle": "descripción exacta de lo acordado, incluyendo fecha/hora si se mencionó",
+  "sintoma": "descripción exacta del problema o avería que describe el cliente | null",
+  "desde_cuando": "cuándo empezó el problema si lo menciona | null",
   "contacto": {
     "nombre": "nombre completo del cliente si lo menciona | null",
-    "empresa": "nombre de la empresa o local si lo menciona | null",
+    "empresa": "nombre del local, bar, restaurante, pizzería o empresa si lo menciona | null",
     "email": "email si lo menciona | null",
-    "direccion": "dirección o ciudad si la menciona | null",
-    "fecha_visita": "fecha y hora acordada si se agendó visita | null"
+    "direccion": "ciudad o dirección donde está la máquina si la menciona | null",
+    "fecha_visita": "fecha y hora acordada si se agendó visita | null",
+    "mac_digitos": "últimos dígitos del código MAC o número de máquina si los menciona | null"
   }
 }
 
@@ -185,6 +188,10 @@ Reglas:
 - accion: extrae SIEMPRE la acción acordada. Si se agendó visita → "agendar_visita"
 - accion_detalle: sé específico. Ej: "Visita acordada para el martes 18 a las 10h en Barcelona"
 - contacto: extrae SOLO lo que el cliente diga explícitamente, no inventes
+- Para averías/soporte: extrae en contacto.direccion la ciudad o local donde está la máquina
+- Si el cliente menciona números como "la 32", "la de Granollers", "los últimos dígitos XX" → ponlos en accion_detalle
+- sintoma: describe con precisión qué falla según el cliente (ej: "no dispensa pizzas", "pantalla bloqueada", "no acepta pagos")
+- desde_cuando: extrae cuándo empezó el problema (ej: "desde esta mañana", "desde ayer", "hace 2 días")
 - RESPONDE SOLO CON JSON VÁLIDO
 `.trim();
 }
@@ -208,7 +215,12 @@ function parseGeminiJSON(rawText) {
     idioma:         String(parsed.idioma    || "es").toLowerCase(),
     accion:         String(parsed.accion    || "ninguna").toLowerCase(),
     accion_detalle: parsed.accion_detalle || "",
-    contacto:       parsed.contacto      || {},
+    sintoma:        parsed.sintoma        || "",
+    desde_cuando:   parsed.desde_cuando   || "",
+    contacto: {
+      ...(parsed.contacto || {}),
+      mac_digitos: parsed.contacto?.mac_digitos || null,
+    },
   };
 }
 
@@ -437,10 +449,82 @@ async function findMachinesByPartner(uid, partnerId) {
   try {
     const recs = await odooExec(uid, "x_maquina_operador", "search_read",
       [[["x_cliente", "=", partnerId]]],
-      { fields: ["id", "x_name", "x_studio_x_machine_uid", "x_estado", "x_ubicacion"], limit: 10 }, 20);
+      { fields: ["id", "x_name", "x_studio_x_machine_uid", "x_estado", "x_ubicacion", "x_site", "x_mac_code"], limit: 10 }, 20);
     return Array.isArray(recs) ? recs : [];
   } catch (e) {
     console.warn("[machines] Error:", e.message);
+    return [];
+  }
+}
+
+// Búsqueda avanzada de máquinas cuando el cliente no está vinculado
+// Busca por ubicación, últimos dígitos MAC, nombre del local
+async function findMachinesByHints(uid, ai) {
+  const hints = [];
+  const c = ai.contacto || {};
+
+  // Extraer pistas de la conversación
+  const textoCompleto = [
+    ai.resumen, ai.accion_detalle,
+    c.empresa, c.direccion, c.nombre,
+  ].filter(Boolean).join(" ").toLowerCase();
+
+  // Buscar últimos dígitos numéricos mencionados (ej: "la 32", "máquina 4")
+  const digitMatches = textoCompleto.match(/(\d{1,4})/g) || [];
+  // Si la IA detectó dígitos MAC explícitos, priorizarlos
+  if (ai.contacto?.mac_digitos) {
+    const macD = String(ai.contacto.mac_digitos).replace(/[^0-9]/g, "");
+    if (macD && !digitMatches.includes(macD)) digitMatches.unshift(macD);
+  }
+  const ubicacion = c.direccion || c.empresa || "";
+
+  if (!ubicacion && digitMatches.length === 0) return [];
+
+  const domain = [];
+
+  // Buscar por nombre del local (lo más fácil de recordar para el cliente)
+  if (c.empresa) {
+    domain.push("|");
+    domain.push(["x_name", "ilike", c.empresa]);
+    domain.push(["x_name", "ilike", c.empresa]);
+  }
+
+  // Buscar por ubicación/ciudad
+  if (ubicacion) {
+    domain.push("|");
+    domain.push(["x_ubicacion", "ilike", ubicacion]);
+    domain.push(["x_site",      "ilike", ubicacion]);
+  }
+
+  // Buscar por nombre del cliente si lo menciona
+  if (c.nombre) {
+    domain.push("|");
+    domain.push(["x_name", "ilike", c.nombre]);
+    domain.push(["x_notas", "ilike", c.nombre]);
+  }
+
+  // Buscar por últimos dígitos del MAC o UID
+  for (const digits of digitMatches.slice(0, 3)) {
+    if (parseInt(digits) > 0) {
+      domain.push("|");
+      domain.push(["x_mac_code",              "ilike", digits]);
+      domain.push(["x_studio_x_machine_uid",  "ilike", digits]);
+    }
+  }
+
+  if (domain.length === 0) return [];
+
+  try {
+    const recs = await odooExec(uid, "x_maquina_operador", "search_read",
+      [domain],
+      { fields: ["id", "x_name", "x_studio_x_machine_uid", "x_estado", "x_ubicacion", "x_site", "x_mac_code", "x_cliente"], limit: 5 }, 22);
+    const results = Array.isArray(recs) ? recs : [];
+    if (results.length > 0) {
+      console.log(`[machines] ${results.length} máquinas encontradas por pistas:`, results.map(m => m.x_name).join(", "));
+    }
+    return results;
+  } catch (e) {
+    console.warn("[machines] Búsqueda por pistas fallida:", e.message);
     return [];
   }
 }
@@ -492,6 +576,7 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
     c.email      ? `<strong>Email:</strong> ${c.email}` : "",
     c.direccion  ? `<strong>Dirección:</strong> ${c.direccion}` : "",
     c.fecha_visita ? `<strong>📅 Fecha visita:</strong> ${c.fecha_visita}` : "",
+    c.mac_digitos  ? `<strong>🔢 Dígitos máquina:</strong> ${c.mac_digitos}` : "",
   ].filter(Boolean).join("<br/>");
 
   const calLink = ODOO_APPOINTMENT_URL
@@ -504,8 +589,15 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
        ${ai.accion === "agendar_visita" ? calLink : ""}
        </p>` : "";
 
+  const now = new Date();
+  const horaLlamada = now.toLocaleString("es-ES", {
+    timeZone: "Europe/Madrid",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit"
+  });
+
   const body = `
-<p><strong>📞 Llamada recibida</strong><br/>
+<p><strong>📞 Llamada recibida</strong> &nbsp; <em>${horaLlamada}</em><br/>
 <strong>Tel:</strong> ${callerPhone||"?"} &nbsp; <strong>Ext:</strong> ${extensionInfo||"?"}</p>
 <p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
 ${accionHtml}
@@ -556,8 +648,14 @@ async function createLead(uid, ai, callerPhone, callerName, partnerId, extension
     c2.fecha_visita ? `<strong>📅 Fecha visita:</strong> ${c2.fecha_visita}` : "",
   ].filter(Boolean).join("<br/>");
 
+  const nowL = new Date();
+  const horaLead = nowL.toLocaleString("es-ES", {
+    timeZone: "Europe/Madrid",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit"
+  });
   const description = `
-<p><strong>📞 Llamada recibida</strong><br/>
+<p><strong>📞 Llamada recibida</strong> &nbsp; <em>${horaLead}</em><br/>
 <strong>Teléfono:</strong> ${callerPhone||"?"} &nbsp; <strong>Extensión:</strong> ${extensionInfo||"?"}</p>
 <p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
 ${ai.accion && ai.accion !== "ninguna" ? `<p style="background:#fff3cd;padding:8px;border-radius:4px;"><strong>⚡ Acción requerida:</strong> ${accionMap2[ai.accion]||ai.accion}<br/>${ai.accion_detalle ? `<em>${ai.accion_detalle}</em>` : ""}</p>` : ""}
@@ -591,13 +689,38 @@ async function createTicket(uid, ai, callerPhone, callerName, partnerId, machine
     ? machines.map(m => `- ${m.x_name||"?"} (ID: ${m.x_studio_x_machine_uid||m.id}, Estado: ${m.x_estado||"?"}, Ub: ${m.x_ubicacion||"?"})`).join("\n")
     : "- Sin máquinas registradas";
 
-  const description = [
-    `📞 Llamada SAT`, `Tel: ${callerPhone||"?"}`, `Ext: ${extensionInfo||"?"}`,
-    callId ? `Call ID: ${callId}` : "",
-    ``, `🤖 RESUMEN IA:`, ai.resumen||"",
-    ``, `Categoría: ${ai.categoria} | Urgencia: ${ai.urgencia}`,
-    ``, `🔧 MÁQUINAS:`, machinesTxt,
-  ].join("\n").trim();
+  const urgMap  = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
+  const c = ai.contacto || {};
+  const nowT = new Date();
+  const horaTicket = nowT.toLocaleString("es-ES", {
+    timeZone: "Europe/Madrid",
+    day: "2-digit", month: "2-digit", year: "numeric",
+    hour: "2-digit", minute: "2-digit"
+  });
+
+  const description = `
+<p><strong>📞 Llamada SAT recibida</strong> &nbsp; <em>${horaTicket}</em><br/>
+<strong>Teléfono:</strong> ${callerPhone||"?"} &nbsp; <strong>Extensión:</strong> ${extensionInfo||"?"}</p>
+
+<p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
+
+${ai.sintoma ? `<p style="background:#ffe0e0;padding:8px;border-radius:4px;">
+<strong>🔧 Síntoma / Avería:</strong><br/>
+${ai.sintoma}
+${ai.desde_cuando ? `<br/><strong>Desde cuándo:</strong> ${ai.desde_cuando}` : ""}
+</p>` : ""}
+
+${ai.accion && ai.accion !== "ninguna" ? `<p style="background:#fff3cd;padding:8px;border-radius:4px;">
+<strong>⚡ Acción requerida:</strong> ${ai.accion_detalle||ai.accion}
+</p>` : ""}
+
+<p><strong>🔧 Máquinas del cliente:</strong><br/>
+${machinesTxt.replace(/\n/g, "<br/>")}</p>
+
+${c.mac_digitos ? `<p><strong>🔢 Dígitos máquina mencionados:</strong> ${c.mac_digitos}</p>` : ""}
+
+<p><strong>Urgencia:</strong> ${urgMap[ai.urgencia]||ai.urgencia}</p>
+`.trim();
 
   const vals = {
     name:          buildTicketName(ai, callerName, callerPhone),
@@ -651,7 +774,12 @@ async function processCallWithAI({ ai, callerPhone, callerName, extensionInfo, c
   }
 
   if (ai.tipo === "ticket") {
-    const machines = partnerId ? await findMachinesByPartner(uid, partnerId) : [];
+    // Buscar máquinas: primero por cliente, luego por pistas (ubicación, dígitos MAC)
+    let machines = partnerId ? await findMachinesByPartner(uid, partnerId) : [];
+    if (machines.length === 0) {
+      console.log("[machines] Sin máquinas por cliente, buscando por pistas...");
+      machines = await findMachinesByHints(uid, ai);
+    }
     if (machines.length > 0) {
       const ticketId = await createTicket(uid, ai, callerPhone, callerName, partnerId, machines, extensionInfo, callId);
       await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
