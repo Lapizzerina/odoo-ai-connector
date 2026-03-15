@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.5.5";
+const VERSION      = "v3.5.6";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -607,7 +607,10 @@ ${contactoLines ? `<p><strong>👤 Datos:</strong><br/>${contactoLines}</p>` : "
 
   try {
     await odooExec(uid, "res.partner", "message_post", [[partnerId]], {
-      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
+      body:            body,
+      message_type:    "comment",
+      subtype_xmlid:   "mail.mt_note",
+      content_subtype: "html",
     }, 55);
     console.log(`[Odoo] Nota en contacto #${partnerId}`);
   } catch (e) { console.warn("[Odoo] Nota fallida:", e.message); }
@@ -882,6 +885,37 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
       } catch (e2) { console.error("[Fallback] Falló:", e2.message); }
     }
   });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ENDPOINT TEST — verificar que HTML renderiza en Odoo
+// ════════════════════════════════════════════════════════════════════════════
+app.post("/test/nota", async (req, res) => {
+  const { partner_id } = req.body || {};
+  if (!partner_id) return res.status(400).json({ ok: false, error: "Envía partner_id" });
+  try {
+    const uid  = await odooAuth();
+    const body = `
+<p><strong>📞 Llamada recibida</strong> &nbsp; <em>TEST ${new Date().toLocaleString("es-ES", { timeZone: "Europe/Madrid" })}</em><br/>
+<strong>Tel:</strong> +34600000000 &nbsp; <strong>Ext:</strong> ext. 200</p>
+<p><strong>🤖 Resumen:</strong> Esta es una nota de prueba para verificar que el HTML renderiza correctamente.</p>
+<p style="background:#fff3cd;padding:8px;border-radius:4px;">
+<strong>⚡ Acción requerida:</strong> 📅 Agendar visita<br/>
+<em>Visita acordada para el martes 18 a las 10h</em>
+</p>
+<p><strong>👤 Datos:</strong><br/>
+<strong>Nombre:</strong> Juan García<br/>
+<strong>Empresa:</strong> Pizzería Roma<br/>
+<strong>Dirección:</strong> Granollers</p>
+<p><strong>Categoría:</strong> Venta máquina &nbsp; <strong>Urgencia:</strong> 🟡 Media</p>
+`.trim();
+    await odooExec(uid, "res.partner", "message_post", [[parseInt(partner_id)]], {
+      body, message_type: "comment", subtype_xmlid: "mail.mt_note", content_subtype: "html",
+    }, 55);
+    return res.json({ ok: true, message: `Nota enviada al contacto #${partner_id}` });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
