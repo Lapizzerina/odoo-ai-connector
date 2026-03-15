@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.3.1";
+const VERSION      = "v3.4.0";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -264,6 +264,82 @@ async function transcribeWithWhisper(buffer, mimetype) {
 // ════════════════════════════════════════════════════════════════════════════
 //  GEMINI TEXTO — analizar transcripción ya hecha
 // ════════════════════════════════════════════════════════════════════════════
+// DeepSeek — análisis de texto (fallback a Gemini si no hay key)
+// Muy barato (~0.001$/1K tokens) y sin rate limits agresivos
+async function analyzeTextWithDeepSeek(transcript, callerPhone, extensionInfo) {
+  const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
+  if (!DEEPSEEK_API_KEY) throw new Error("Falta DEEPSEEK_API_KEY");
+
+  const prompt = buildSystemPrompt() + "\n\n---\n" +
+    `Llamada de Piznalia/SmartChef24h.\n` +
+    `Teléfono: ${callerPhone||"?"} | Extensión: ${extensionInfo||"?"}\n\n` +
+    `TRANSCRIPCIÓN:\n${transcript}\n\nDevuelve el JSON.`;
+
+  const resp = await fetch("https://api.deepseek.com/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${DEEPSEEK_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "deepseek-chat",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 500,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(`DeepSeek HTTP ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  const rawText = data?.choices?.[0]?.message?.content || "";
+  if (!rawText) throw new Error("DeepSeek devolvió contenido vacío");
+  console.log("[DeepSeek] Respuesta:", rawText.slice(0, 200));
+  return parseGeminiJSON(rawText);
+}
+
+// GPT-4o mini — análisis de texto (misma cuenta que Whisper, ~0.01€/mes)
+async function analyzeTextWithGPT(transcript, callerPhone, extensionInfo) {
+  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
+
+  const prompt = buildSystemPrompt() + "\n\n---\n" +
+    `Llamada de Piznalia/SmartChef24h.\n` +
+    `Teléfono: ${callerPhone||"?"} | Extensión: ${extensionInfo||"?"}\n\n` +
+    `TRANSCRIPCIÓN:\n${transcript}\n\nDevuelve el JSON.`;
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      response_format: { type: "json_object" },
+      max_tokens: 500,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(`GPT HTTP ${resp.status}: ${await resp.text()}`);
+  const data = await resp.json();
+  const rawText = data?.choices?.[0]?.message?.content || "";
+  if (!rawText) throw new Error("GPT devolvió contenido vacío");
+  console.log("[GPT-4o mini] Respuesta:", rawText.slice(0, 200));
+  return parseGeminiJSON(rawText);
+}
+
+// Analizar texto — usa GPT-4o mini (misma cuenta Whisper), fallback Gemini
+async function analyzeText(transcript, callerPhone, extensionInfo) {
+  if (OPENAI_API_KEY) {
+    try {
+      return await analyzeTextWithGPT(transcript, callerPhone, extensionInfo);
+    } catch (e) {
+      console.warn(`[GPT] Falló: ${e.message} → usando Gemini`);
+    }
+  }
+  return await analyzeTextWithGemini(transcript, callerPhone, extensionInfo);
+}
+
 async function analyzeTextWithGemini(transcript, callerPhone, extensionInfo) {
   const prompt = buildSystemPrompt() +
     `\n\n---\nLlamada de Piznalia/SmartChef24h.\n` +
@@ -300,8 +376,8 @@ async function analyzeCallFromOdoo(uid, callIdWithRec, callerPhone, extensionInf
       if (OPENAI_API_KEY) {
         console.log("[Audio] Intentando fallback Whisper...");
         const transcript = await transcribeWithWhisper(buffer, mimetype);
-        const ai = await analyzeTextWithGemini(transcript, callerPhone, extensionInfo);
-        console.log(`[IA] Whisper+Gemini OK: tipo=${ai.tipo} | ${ai.resumen}`);
+        const ai = await analyzeText(transcript, callerPhone, extensionInfo);
+        console.log(`[IA] Whisper+GPT OK: tipo=${ai.tipo} | ${ai.resumen}`);
         return ai;
       }
 
