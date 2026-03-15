@@ -19,7 +19,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.1.2";
+const VERSION      = "v3.2.0";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL          = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -95,6 +95,31 @@ app.get("/", (req, res) => res.json({
 // ════════════════════════════════════════════════════════════════════════════
 //  WHISPER — transcripción de audio
 // ════════════════════════════════════════════════════════════════════════════
+async function transcribeAudioBuffer(buffer, filename, mimetype) {
+  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
+
+  const formData = new FormData();
+  formData.append("file", new Blob([buffer], { type: mimetype || "audio/ogg" }), filename || "recording.ogg");
+  formData.append("model", "whisper-1");
+  formData.append("language", "es");
+  formData.append("response_format", "text");
+
+  const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: formData,
+  });
+
+  if (!resp.ok) {
+    const err = await resp.text().catch(() => "");
+    throw new Error(`Whisper HTTP ${resp.status}: ${err}`);
+  }
+
+  const text = (await resp.text()).trim();
+  console.log("[Whisper] Transcripción OK, chars:", text.length);
+  return text;
+}
+
 async function transcribeAudioUrl(audioUrl) {
   if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
   console.log("[Whisper] Descargando audio:", audioUrl);
@@ -128,7 +153,7 @@ async function transcribeAudioUrl(audioUrl) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ZADARMA API — firma HMAC + obtener URL grabación
+//  ZADARMA API — firma HMAC (mantenida por si acaso, no se usa en flujo principal)
 // ════════════════════════════════════════════════════════════════════════════
 function zadarmaSign(method, params, secret) {
   // Implementación EXACTA del PHP oficial de Zadarma (Client.php):
@@ -172,6 +197,79 @@ async function getZadarmaRecordingUrl(callIdWithRec) {
   if (data.status !== "success" || !link) throw new Error(`Sin link: ${raw}`);
 
   return link;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ODOO ATTACHMENTS — buscar y descargar audio desde Odoo
+//  Zadarma sube el audio como ir.attachment en res.partner
+//  El nombre del fichero contiene el call_id_with_rec
+// ════════════════════════════════════════════════════════════════════════════
+
+async function getAudioFromOdoo(uid, callIdWithRec) {
+  // Buscar el adjunto por nombre (contiene el call_id_with_rec)
+  console.log("[Odoo Audio] Buscando adjunto para call_id:", callIdWithRec);
+
+  const attachments = await odooExec(uid, "ir.attachment", "search_read",
+    [[["name", "ilike", callIdWithRec]]],
+    { fields: ["id", "name", "mimetype", "res_model", "res_id"], limit: 5 }, 90
+  );
+
+  if (!attachments || attachments.length === 0) {
+    throw new Error(`No se encontró adjunto para call_id_with_rec: ${callIdWithRec}`);
+  }
+
+  const attachment = attachments[0];
+  console.log(`[Odoo Audio] Adjunto encontrado: id=${attachment.id} nombre=${attachment.name} mime=${attachment.mimetype}`);
+
+  // Descargar el audio usando la URL de Odoo con autenticación
+  const audioUrl = `${ODOO_BASE_URL}/web/content/${attachment.id}?download=true`;
+  console.log("[Odoo Audio] Descargando desde:", audioUrl);
+
+  const resp = await fetch(audioUrl, {
+    headers: {
+      // Odoo acepta API key como Bearer o como parámetro
+      "Authorization": `Bearer ${ODOO_API_KEY}`,
+    },
+    redirect: "follow",
+  });
+
+  if (!resp.ok) {
+    // Intentar con cookie de sesión usando JSON-RPC authenticate
+    throw new Error(`No se pudo descargar audio de Odoo: HTTP ${resp.status}`);
+  }
+
+  const buffer = await resp.arrayBuffer();
+  console.log("[Odoo Audio] Audio descargado:", buffer.byteLength, "bytes, mime:", attachment.mimetype);
+
+  return { buffer, mimetype: attachment.mimetype || "audio/ogg", attachmentId: attachment.id };
+}
+
+async function transcribeFromOdoo(uid, callIdWithRec) {
+  // Esperar a que Zadarma suba el audio a Odoo
+  console.log("[Odoo Audio] Esperando 30s para que Zadarma suba el audio a Odoo...");
+  await new Promise(r => setTimeout(r, 30000));
+
+  // Reintentos por si el audio tarda más
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const { buffer, mimetype } = await getAudioFromOdoo(uid, callIdWithRec);
+
+      // Determinar extensión según mimetype
+      const ext = mimetype.includes("ogg") ? "recording.ogg"
+                : mimetype.includes("mp3") || mimetype.includes("mpeg") ? "recording.mp3"
+                : "recording.wav";
+
+      // Transcribir con Whisper
+      const transcript = await transcribeAudioBuffer(buffer, ext, mimetype);
+      return transcript;
+    } catch (e) {
+      lastError = e;
+      console.warn(`[Odoo Audio] Intento ${attempt}/3 fallido: ${e.message}`);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 15000));
+    }
+  }
+  throw lastError;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -605,15 +703,10 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
   // Procesamiento asíncrono
   setImmediate(async () => {
     try {
-      // Zadarma recomienda esperar antes de pedir la grabación
-      console.log("[Zadarma] Esperando 45s para que la grabación esté disponible...");
-      await new Promise(r => setTimeout(r, 45000));
-
-      // 1. Obtener URL del audio
-      const audioUrl = await getZadarmaRecordingUrl(callIdWithRec);
-
-      // 2. Transcribir con Whisper
-      const transcript = await transcribeAudioUrl(audioUrl);
+      // Zadarma sube el audio a Odoo automáticamente como ir.attachment
+      // Buscamos el audio directamente en Odoo sin necesidad de la API de Zadarma
+      const uid = await odooAuth();
+      const transcript = await transcribeFromOdoo(uid, callIdWithRec);
       if (!transcript || transcript.trim().length < 5) {
         console.warn("[Whisper] Transcripción vacía, descartando.");
         return;
@@ -697,5 +790,6 @@ app.listen(PORT, () => {
   console.log(`  Odoo:    ${ODOO_BASE_URL || "⚠ NO CONFIGURADO"}`);
   console.log(`  Gemini:  ${GEMINI_API_KEY ? "✓" : "⚠ NO CONFIGURADO"}`);
   console.log(`  Whisper: ${OPENAI_API_KEY ? "✓" : "⚠ NO CONFIGURADO"}`);
-  console.log(`  Zadarma: ${ZADARMA_API_KEY ? "✓" : "⚠ NO CONFIGURADO"}`);
+  console.log(`  Zadarma key:    [${ZADARMA_API_KEY}] len=${ZADARMA_API_KEY.length}`);
+  console.log(`  Zadarma secret: [${ZADARMA_API_SECRET}] len=${ZADARMA_API_SECRET.length}`);
 });
