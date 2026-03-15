@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.5.8";
+const VERSION      = "v3.5.9";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -562,7 +562,7 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
     operador_vending: "Operador vending", averia: "Avería",
     consulta_tecnica: "Consulta técnica", info_general: "Info general", otros: "Otros",
   };
-  const urgMap = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
+  const urgMap  = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
   const accionMap = {
     agendar_visita: "📅 Agendar visita", confirmar_cita: "✅ Confirmar cita",
     enviar_info: "📧 Enviar información", enviar_presupuesto: "💶 Enviar presupuesto",
@@ -570,46 +570,58 @@ async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo,
     cerrar_ticket: "🔒 Cerrar ticket", ninguna: "—",
   };
   const c = ai.contacto || {};
-  const contactoLines = [
-    c.nombre     ? `<strong>Nombre:</strong> ${c.nombre}` : "",
-    c.empresa    ? `<strong>Empresa:</strong> ${c.empresa}` : "",
-    c.email      ? `<strong>Email:</strong> ${c.email}` : "",
-    c.direccion  ? `<strong>Dirección:</strong> ${c.direccion}` : "",
-    c.fecha_visita ? `<strong>📅 Fecha visita:</strong> ${c.fecha_visita}` : "",
-    c.mac_digitos  ? `<strong>🔢 Dígitos máquina:</strong> ${c.mac_digitos}` : "",
-  ].filter(Boolean).join("<br/>");
-
-  const calLink = ODOO_APPOINTMENT_URL
-    ? `<br/><a href="${ODOO_APPOINTMENT_URL}" target="_blank">📅 Abrir calendario para agendar</a>` : "";
-
-  const accionHtml = (ai.accion && ai.accion !== "ninguna")
-    ? `<p style="background:#fff3cd;padding:8px;border-radius:4px;margin:4px 0;">
-       <strong>⚡ Acción requerida:</strong> ${accionMap[ai.accion]||ai.accion}<br/>
-       ${ai.accion_detalle ? `<em>${ai.accion_detalle}</em>` : ""}
-       ${ai.accion === "agendar_visita" ? calLink : ""}
-       </p>` : "";
-
   const now = new Date();
-  const horaLlamada = now.toLocaleString("es-ES", {
+  const hora = now.toLocaleString("es-ES", {
     timeZone: "Europe/Madrid",
     day: "2-digit", month: "2-digit", year: "numeric",
     hour: "2-digit", minute: "2-digit"
   });
 
-  const body = `
-<p><strong>📞 Llamada recibida</strong> &nbsp; <em>${horaLlamada}</em><br/>
-<strong>Tel:</strong> ${callerPhone||"?"} &nbsp; <strong>Ext:</strong> ${extensionInfo||"?"}</p>
-<p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
-${accionHtml}
-${contactoLines ? `<p><strong>👤 Datos:</strong><br/>${contactoLines}</p>` : ""}
-<p><strong>Categoría:</strong> ${catMap[ai.categoria]||ai.categoria} &nbsp; <strong>Urgencia:</strong> ${urgMap[ai.urgencia]||ai.urgencia}</p>
-`.trim();
+  const lines = [
+    `📞 LLAMADA RECIBIDA — ${hora}`,
+    `Tel: ${callerPhone||"?"} | Ext: ${extensionInfo||"?"}`,
+    ``,
+    `🤖 Resumen: ${ai.resumen||""}`,
+  ];
+
+  if (ai.accion && ai.accion !== "ninguna") {
+    lines.push(``);
+    lines.push(`⚡ ACCIÓN: ${accionMap[ai.accion]||ai.accion}`);
+    if (ai.accion_detalle) lines.push(`   ${ai.accion_detalle}`);
+    if (ai.accion === "agendar_visita" && ODOO_APPOINTMENT_URL) {
+      lines.push(`   🔗 ${ODOO_APPOINTMENT_URL}`);
+    }
+  }
+
+  if (ai.sintoma) {
+    lines.push(``);
+    lines.push(`🔧 Síntoma: ${ai.sintoma}`);
+    if (ai.desde_cuando) lines.push(`   Desde: ${ai.desde_cuando}`);
+  }
+
+  const contactoData = [
+    c.nombre      ? `Nombre: ${c.nombre}`           : "",
+    c.empresa     ? `Empresa: ${c.empresa}`          : "",
+    c.email       ? `Email: ${c.email}`              : "",
+    c.direccion   ? `Dirección: ${c.direccion}`      : "",
+    c.fecha_visita? `Visita: ${c.fecha_visita}`      : "",
+    c.mac_digitos ? `Dígitos máquina: ${c.mac_digitos}` : "",
+  ].filter(Boolean);
+
+  if (contactoData.length > 0) {
+    lines.push(``);
+    lines.push(`👤 Datos cliente:`);
+    contactoData.forEach(d => lines.push(`   ${d}`));
+  }
+
+  lines.push(``);
+  lines.push(`Categoría: ${catMap[ai.categoria]||ai.categoria} | Urgencia: ${urgMap[ai.urgencia]||ai.urgencia}`);
+
+  const body = lines.join("\n");
 
   try {
     await odooExec(uid, "res.partner", "message_post", [[partnerId]], {
-      body:            body,
-      message_type:  "email",
-      subtype_xmlid: "mail.mt_comment",
+      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
     }, 55);
     console.log(`[Odoo] Nota en contacto #${partnerId}`);
   } catch (e) { console.warn("[Odoo] Nota fallida:", e.message); }
@@ -894,22 +906,26 @@ app.post("/test/nota", async (req, res) => {
   if (!partner_id) return res.status(400).json({ ok: false, error: "Envía partner_id" });
   try {
     const uid  = await odooAuth();
-    const body = `
-<p><strong>📞 Llamada recibida</strong> &nbsp; <em>TEST ${new Date().toLocaleString("es-ES", { timeZone: "Europe/Madrid" })}</em><br/>
-<strong>Tel:</strong> +34600000000 &nbsp; <strong>Ext:</strong> ext. 200</p>
-<p><strong>🤖 Resumen:</strong> Esta es una nota de prueba para verificar que el HTML renderiza correctamente.</p>
-<p style="background:#fff3cd;padding:8px;border-radius:4px;">
-<strong>⚡ Acción requerida:</strong> 📅 Agendar visita<br/>
-<em>Visita acordada para el martes 18 a las 10h</em>
-</p>
-<p><strong>👤 Datos:</strong><br/>
-<strong>Nombre:</strong> Juan García<br/>
-<strong>Empresa:</strong> Pizzería Roma<br/>
-<strong>Dirección:</strong> Granollers</p>
-<p><strong>Categoría:</strong> Venta máquina &nbsp; <strong>Urgencia:</strong> 🟡 Media</p>
-`.trim();
+    const horaTest = new Date().toLocaleString("es-ES", { timeZone: "Europe/Madrid", day:"2-digit", month:"2-digit", year:"numeric", hour:"2-digit", minute:"2-digit" });
+    const body = [
+      `📞 LLAMADA RECIBIDA — ${horaTest}`,
+      `Tel: +34600000000 | Ext: ext. 200`,
+      ``,
+      `🤖 Resumen: Esta es una nota de prueba.`,
+      ``,
+      `⚡ ACCIÓN: 📅 Agendar visita`,
+      `   Visita acordada para el martes 18 a las 10h`,
+      `   🔗 https://piznalia1.odoo.com/book/f3a63454`,
+      ``,
+      `👤 Datos cliente:`,
+      `   Nombre: Juan García`,
+      `   Empresa: Pizzería Roma`,
+      `   Dirección: Granollers`,
+      ``,
+      `Categoría: Venta máquina | Urgencia: 🟡 Media`,
+    ].join("\n");
     await odooExec(uid, "res.partner", "message_post", [[parseInt(partner_id)]], {
-      body, message_type: "email", subtype_xmlid: "mail.mt_comment",
+      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
     }, 55);
     return res.json({ ok: true, message: `Nota enviada al contacto #${partner_id}` });
   } catch (e) {
