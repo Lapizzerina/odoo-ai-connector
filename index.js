@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.4.0";
+const VERSION      = "v3.5.1";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -166,8 +166,27 @@ Formato exacto:
   "interes": "Máquinas de pizzas y comida | Pizza sector Horeca | Ambos | Otros",
   "sector": "Pizzería o restauración | Operador vending | Inversor | Particular | Otros",
   "urgencia": "alta | media | baja",
-  "resumen": "frase breve máximo 2 líneas",
-  "idioma": "es | ca | en | fr | pt"
+  "resumen": "frase breve máximo 2 líneas de qué trató la llamada",
+  "idioma": "es | ca | en | fr | pt",
+  "accion": "agendar_visita | confirmar_cita | enviar_info | enviar_presupuesto | llamar_cliente | esperar_cliente | cerrar_ticket | ninguna",
+  "accion_detalle": "descripción exacta de lo acordado, incluyendo fecha/hora si se mencionó",
+  "contacto": {
+    "nombre": "nombre completo del cliente si lo menciona | null",
+    "empresa": "nombre de la empresa o local si lo menciona | null",
+    "email": "email si lo menciona | null",
+    "direccion": "dirección o ciudad si la menciona | null",
+    "fecha_visita": "fecha y hora acordada si se agendó visita | null"
+  }
+}
+
+Reglas:
+- tipo="ticket" SOLO si el cliente describe claramente una avería o fallo técnico
+- tipo="lead" en cualquier otro caso
+- accion: extrae SIEMPRE la acción acordada. Si se agendó visita → "agendar_visita"
+- accion_detalle: sé específico. Ej: "Visita acordada para el martes 18 a las 10h en Barcelona"
+- contacto: extrae SOLO lo que el cliente diga explícitamente, no inventes
+- RESPONDE SOLO CON JSON VÁLIDO
+`.trim();
 }
 
 Reglas:
@@ -187,13 +206,16 @@ function parseGeminiJSON(rawText) {
   }
   if (!parsed) throw new Error("JSON no parseable: " + rawText.slice(0, 200));
   return {
-    tipo:      String(parsed.tipo      || "lead").toLowerCase(),
-    categoria: String(parsed.categoria || "otros").toLowerCase(),
-    interes:   parsed.interes  || "Otros",
-    sector:    parsed.sector   || "Otros",
-    urgencia:  String(parsed.urgencia  || "media").toLowerCase(),
-    resumen:   parsed.resumen  || "",
-    idioma:    String(parsed.idioma    || "es").toLowerCase(),
+    tipo:           String(parsed.tipo      || "lead").toLowerCase(),
+    categoria:      String(parsed.categoria || "otros").toLowerCase(),
+    interes:        parsed.interes       || "Otros",
+    sector:         parsed.sector        || "Otros",
+    urgencia:       String(parsed.urgencia  || "media").toLowerCase(),
+    resumen:        parsed.resumen       || "",
+    idioma:         String(parsed.idioma    || "es").toLowerCase(),
+    accion:         String(parsed.accion    || "ninguna").toLowerCase(),
+    accion_detalle: parsed.accion_detalle || "",
+    contacto:       parsed.contacto      || {},
   };
 }
 
@@ -458,13 +480,46 @@ function buildTicketName(ai, callerName, callerPhone) {
 }
 
 async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId) {
-  const body = [
-    `<b>📞 Llamada recibida</b>`,
-    `<b>Tel:</b> ${callerPhone||"?"} | <b>Ext:</b> ${extensionInfo||"?"}`,
-    callId ? `<b>Call ID:</b> ${callId}` : "",
-    `<b>Resumen:</b> ${ai.resumen||""}`,
-    `<b>Categoría:</b> ${ai.categoria} | <b>Urgencia:</b> ${ai.urgencia}`,
+  const catMap = {
+    venta_maquina: "Venta máquina", venta_pizza: "Venta pizzas",
+    operador_vending: "Operador vending", averia: "Avería",
+    consulta_tecnica: "Consulta técnica", info_general: "Info general", otros: "Otros",
+  };
+  const urgMap = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
+  const accionMap = {
+    agendar_visita: "📅 Agendar visita", confirmar_cita: "✅ Confirmar cita",
+    enviar_info: "📧 Enviar información", enviar_presupuesto: "💶 Enviar presupuesto",
+    llamar_cliente: "📞 Llamar al cliente", esperar_cliente: "⏳ Esperar al cliente",
+    cerrar_ticket: "🔒 Cerrar ticket", ninguna: "—",
+  };
+  const c = ai.contacto || {};
+  const contactoLines = [
+    c.nombre     ? `<strong>Nombre:</strong> ${c.nombre}` : "",
+    c.empresa    ? `<strong>Empresa:</strong> ${c.empresa}` : "",
+    c.email      ? `<strong>Email:</strong> ${c.email}` : "",
+    c.direccion  ? `<strong>Dirección:</strong> ${c.direccion}` : "",
+    c.fecha_visita ? `<strong>📅 Fecha visita:</strong> ${c.fecha_visita}` : "",
   ].filter(Boolean).join("<br/>");
+
+  const calLink = ODOO_APPOINTMENT_URL
+    ? `<br/><a href="${ODOO_APPOINTMENT_URL}" target="_blank">📅 Abrir calendario para agendar</a>` : "";
+
+  const accionHtml = (ai.accion && ai.accion !== "ninguna")
+    ? `<p style="background:#fff3cd;padding:8px;border-radius:4px;margin:4px 0;">
+       <strong>⚡ Acción requerida:</strong> ${accionMap[ai.accion]||ai.accion}<br/>
+       ${ai.accion_detalle ? `<em>${ai.accion_detalle}</em>` : ""}
+       ${ai.accion === "agendar_visita" ? calLink : ""}
+       </p>` : "";
+
+  const body = `
+<p><strong>📞 Llamada recibida</strong><br/>
+<strong>Tel:</strong> ${callerPhone||"?"} &nbsp; <strong>Ext:</strong> ${extensionInfo||"?"}</p>
+<p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
+${accionHtml}
+${contactoLines ? `<p><strong>👤 Datos:</strong><br/>${contactoLines}</p>` : ""}
+<p><strong>Categoría:</strong> ${catMap[ai.categoria]||ai.categoria} &nbsp; <strong>Urgencia:</strong> ${urgMap[ai.urgencia]||ai.urgencia}</p>
+`.trim();
+
   try {
     await odooExec(uid, "res.partner", "message_post", [[partnerId]], {
       body, message_type: "comment", subtype_xmlid: "mail.mt_note",
@@ -486,17 +541,36 @@ async function createLead(uid, ai, callerPhone, callerName, partnerId, extension
   }
   respuesta += "\nUn saludo,\nEquipo Piznalia / La Pizzerina";
 
-  const description = [
-    `📞 Llamada recibida`,
-    `Teléfono: ${callerPhone||"?"}`,
-    `Extensión: ${extensionInfo||"?"}`,
-    callId ? `Call ID: ${callId}` : "",
-    ``,
-    `🤖 RESUMEN IA:`,
-    ai.resumen || "",
-    ``,
-    `Categoría: ${ai.categoria} | Urgencia: ${ai.urgencia} | Idioma: ${ai.idioma}`,
-  ].filter(Boolean).join("\n").trim();
+  const catMap = {
+    venta_maquina: "Venta máquina", venta_pizza: "Venta pizzas",
+    operador_vending: "Operador vending", averia: "Avería",
+    consulta_tecnica: "Consulta técnica", info_general: "Info general", otros: "Otros",
+  };
+  const urgMap = { alta: "🔴 Alta", media: "🟡 Media", baja: "🟢 Baja" };
+
+  const accionMap2 = {
+    agendar_visita: "📅 Agendar visita", confirmar_cita: "✅ Confirmar cita",
+    enviar_info: "📧 Enviar información", enviar_presupuesto: "💶 Enviar presupuesto",
+    llamar_cliente: "📞 Llamar al cliente", esperar_cliente: "⏳ Esperar al cliente",
+    cerrar_ticket: "🔒 Cerrar ticket", ninguna: "—",
+  };
+  const c2 = ai.contacto || {};
+  const contactoLines2 = [
+    c2.nombre    ? `<strong>Nombre:</strong> ${c2.nombre}` : "",
+    c2.empresa   ? `<strong>Empresa:</strong> ${c2.empresa}` : "",
+    c2.email     ? `<strong>Email:</strong> ${c2.email}` : "",
+    c2.direccion ? `<strong>Dirección:</strong> ${c2.direccion}` : "",
+    c2.fecha_visita ? `<strong>📅 Fecha visita:</strong> ${c2.fecha_visita}` : "",
+  ].filter(Boolean).join("<br/>");
+
+  const description = `
+<p><strong>📞 Llamada recibida</strong><br/>
+<strong>Teléfono:</strong> ${callerPhone||"?"} &nbsp; <strong>Extensión:</strong> ${extensionInfo||"?"}</p>
+<p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
+${ai.accion && ai.accion !== "ninguna" ? `<p style="background:#fff3cd;padding:8px;border-radius:4px;"><strong>⚡ Acción requerida:</strong> ${accionMap2[ai.accion]||ai.accion}<br/>${ai.accion_detalle ? `<em>${ai.accion_detalle}</em>` : ""}</p>` : ""}
+${contactoLines2 ? `<p><strong>👤 Datos del cliente:</strong><br/>${contactoLines2}</p>` : ""}
+<p><strong>Categoría:</strong> ${catMap[ai.categoria]||ai.categoria} &nbsp; <strong>Urgencia:</strong> ${urgMap[ai.urgencia]||ai.urgencia} &nbsp; <strong>Sector:</strong> ${ai.sector||"?"}</p>
+`.trim();
 
   const vals = {
     name:           buildLeadName(ai, callerName, callerPhone),
@@ -559,6 +633,29 @@ async function processCallWithAI({ ai, callerPhone, callerName, extensionInfo, c
   const { partnerId, isNew } = await findOrCreatePartner(uid, {
     name: callerName, phone: callerPhone, email: null,
   });
+
+  // Crear cita en Calendar si se acordó visita
+  if (ai.accion === "agendar_visita" && ai.contacto?.fecha_visita) {
+    const event = await createCalendarEvent(uid, ai, partnerId, callerName);
+    if (event) {
+      console.log(`[Calendar] Cita creada #${event.eventId} para ${event.start}`);
+    }
+  }
+
+  // Actualizar contacto con datos que la IA haya extraído de la llamada
+  if (partnerId && ai.contacto) {
+    const c = ai.contacto;
+    const updates = {};
+    if (c.nombre && c.nombre !== "null" && isNew) updates.name = c.nombre;
+    if (c.email  && c.email  !== "null") updates.email = c.email;
+    if (c.empresa && c.empresa !== "null") updates.company_name = c.empresa;
+    if (Object.keys(updates).length > 0) {
+      try {
+        await odooExec(uid, "res.partner", "write", [[partnerId], updates], {}, 56);
+        console.log(`[Odoo] Contacto #${partnerId} actualizado:`, Object.keys(updates).join(", "));
+      } catch (e) { console.warn("[Odoo] Update contacto fallido:", e.message); }
+    }
+  }
 
   if (ai.tipo === "ticket") {
     const machines = partnerId ? await findMachinesByPartner(uid, partnerId) : [];
@@ -645,14 +742,22 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
       console.error("[ERROR]", err.message);
       try {
         const uid        = await odooAuth();
-        const partnerRes = callerPhone ? await findOrCreatePartner(uid, { name: callerName, phone: callerPhone, email: null }) : null;
+        const partnerRes = callerPhone
+          ? await findOrCreatePartner(uid, { name: callerName, phone: callerPhone, email: null })
+          : null;
         const aiFallback = {
           tipo: "lead", categoria: "otros", interes: "Otros", sector: "Otros",
           urgencia: "media", idioma: "es",
           resumen: `Llamada no procesada (error: ${err.message.slice(0, 80)})`,
         };
-        const leadId = await createLead(uid, aiFallback, callerPhone, callerName, partnerRes?.partnerId || null, extInfo, callIdWithRec);
-        console.log(`[Fallback] Lead #${leadId}`);
+        // Si el contacto ya existe → solo nota, sin lead nuevo
+        if (partnerRes && !partnerRes.isNew) {
+          await postNoteToPartner(uid, partnerRes.partnerId, aiFallback, callerPhone, extInfo, callIdWithRec);
+          console.log(`[Fallback] Nota en contacto existente #${partnerRes.partnerId}`);
+        } else {
+          const leadId = await createLead(uid, aiFallback, callerPhone, callerName, partnerRes?.partnerId || null, extInfo, callIdWithRec);
+          console.log(`[Fallback] Lead nuevo #${leadId}`);
+        }
       } catch (e2) { console.error("[Fallback] Falló:", e2.message); }
     }
   });
