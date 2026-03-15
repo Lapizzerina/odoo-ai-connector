@@ -19,7 +19,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.2.0";
+const VERSION      = "v3.2.1";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL          = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -205,13 +205,33 @@ async function getZadarmaRecordingUrl(callIdWithRec) {
 //  El nombre del fichero contiene el call_id_with_rec
 // ════════════════════════════════════════════════════════════════════════════
 
+async function getOdooSessionCookie() {
+  // Odoo /web/content requiere sesión autenticada, no API key Bearer
+  // Usamos el endpoint de autenticación web para obtener una cookie de sesión
+  const resp = await fetch(`${ODOO_BASE_URL}/web/dataset/call_kw`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0", method: "call", id: 99,
+      params: {
+        model: "res.users", method: "read",
+        args: [[1]], kwargs: { fields: ["name"] },
+        kwargs_: {},
+      },
+    }),
+  });
+  // Extraer cookie de sesión de la respuesta
+  const setCookie = resp.headers.get("set-cookie") || "";
+  const match = setCookie.match(/session_id=([^;]+)/);
+  return match ? match[1] : null;
+}
+
 async function getAudioFromOdoo(uid, callIdWithRec) {
-  // Buscar el adjunto por nombre (contiene el call_id_with_rec)
   console.log("[Odoo Audio] Buscando adjunto para call_id:", callIdWithRec);
 
   const attachments = await odooExec(uid, "ir.attachment", "search_read",
     [[["name", "ilike", callIdWithRec]]],
-    { fields: ["id", "name", "mimetype", "res_model", "res_id"], limit: 5 }, 90
+    { fields: ["id", "name", "mimetype", "datas", "res_model", "res_id"], limit: 5 }, 90
   );
 
   if (!attachments || attachments.length === 0) {
@@ -221,27 +241,27 @@ async function getAudioFromOdoo(uid, callIdWithRec) {
   const attachment = attachments[0];
   console.log(`[Odoo Audio] Adjunto encontrado: id=${attachment.id} nombre=${attachment.name} mime=${attachment.mimetype}`);
 
-  // Descargar el audio usando la URL de Odoo con autenticación
-  const audioUrl = `${ODOO_BASE_URL}/web/content/${attachment.id}?download=true`;
-  console.log("[Odoo Audio] Descargando desde:", audioUrl);
-
-  const resp = await fetch(audioUrl, {
-    headers: {
-      // Odoo acepta API key como Bearer o como parámetro
-      "Authorization": `Bearer ${ODOO_API_KEY}`,
-    },
-    redirect: "follow",
-  });
-
-  if (!resp.ok) {
-    // Intentar con cookie de sesión usando JSON-RPC authenticate
-    throw new Error(`No se pudo descargar audio de Odoo: HTTP ${resp.status}`);
+  // Método 1: leer el contenido base64 directamente via JSON-RPC (más fiable)
+  if (attachment.datas && attachment.datas.length > 0) {
+    console.log("[Odoo Audio] Usando datas base64 directamente");
+    const buffer = Buffer.from(attachment.datas, "base64");
+    console.log("[Odoo Audio] Audio decodificado:", buffer.byteLength, "bytes");
+    return { buffer, mimetype: attachment.mimetype || "audio/ogg", attachmentId: attachment.id };
   }
 
-  const buffer = await resp.arrayBuffer();
-  console.log("[Odoo Audio] Audio descargado:", buffer.byteLength, "bytes, mime:", attachment.mimetype);
+  // Método 2: descargar via HTTP con access_token
+  // Odoo genera access_token para adjuntos
+  const tokenResp = await odooExec(uid, "ir.attachment", "read",
+    [[attachment.id]], { fields: ["id", "name", "mimetype", "datas"] }, 91
+  );
 
-  return { buffer, mimetype: attachment.mimetype || "audio/ogg", attachmentId: attachment.id };
+  if (tokenResp && tokenResp[0] && tokenResp[0].datas) {
+    const buffer = Buffer.from(tokenResp[0].datas, "base64");
+    console.log("[Odoo Audio] Audio via read():", buffer.byteLength, "bytes");
+    return { buffer, mimetype: attachment.mimetype || "audio/ogg", attachmentId: attachment.id };
+  }
+
+  throw new Error(`No se pudo obtener el contenido del adjunto id=${attachment.id}`);
 }
 
 async function transcribeFromOdoo(uid, callIdWithRec) {
