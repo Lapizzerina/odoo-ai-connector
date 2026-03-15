@@ -1,5 +1,6 @@
-// index.js — odoo-ai-connector + Gemini + Odoo + Zadarma (webhook llamadas)
+// index.js — odoo-ai-connector + Gemini + Whisper + Odoo + Zadarma
 // Node 18+ (Render) — usa fetch nativo
+// v2.0.0 — Añade transcripción automática con Whisper (OpenAI) desde grabaciones Zadarma
 
 const express = require("express");
 const crypto = require("crypto");
@@ -7,16 +8,14 @@ const crypto = require("crypto");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v1.7.0";
+const VERSION = "v2.0.0";
 
 // ========= CONFIG ODOO =========
-const ODOO_BASE_URL = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, ""); // ej: https://piznalia1.odoo.com
-const ODOO_DB = process.env.ODOO_DB || ""; // ej: piznalia1
+const ODOO_BASE_URL = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
+const ODOO_DB = process.env.ODOO_DB || "";
 const ODOO_USER_EMAIL = process.env.ODOO_USER_EMAIL || "";
 const ODOO_API_KEY = process.env.ODOO_API_KEY || "";
 const ODOO_APPOINTMENT_URL = process.env.ODOO_APPOINTMENT_URL || "";
-
-// Helpdesk
 const ODOO_HELPDESK_TEAM_NAME =
   process.env.ODOO_HELPDESK_TEAM_NAME || "Atención al cliente";
 
@@ -24,12 +23,23 @@ const ODOO_HELPDESK_TEAM_NAME =
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
+// ========= CONFIG OPENAI (Whisper) =========
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
+// ========= CONFIG ZADARMA =========
+const ZADARMA_API_KEY = process.env.ZADARMA_API_KEY || "";
+const ZADARMA_API_SECRET = process.env.ZADARMA_API_SECRET || "";
+// Token de seguridad opcional para verificar que el webhook viene de Zadarma
+const SECURITY_TOKEN = process.env.SECURITY_TOKEN || "";
+
 // cache simple
 let cachedOdooUid = null;
 let cachedHelpdeskTeamId = null;
-let cachedHelpdeskHasMachineField = null; // true/false
+let cachedHelpdeskHasMachineField = null;
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
+// Zadarma puede mandar form-urlencoded en algunos eventos
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 // CORS básico
 app.use((req, res, next) => {
@@ -49,12 +59,141 @@ app.get("/health", (req, res) => {
     ok: true,
     service: SERVICE_NAME,
     version: VERSION,
-    message: "Usa GET /health o POST /lead/analyze",
+    whisper: !!OPENAI_API_KEY,
+    gemini: !!GEMINI_API_KEY,
+    zadarma: !!(ZADARMA_API_KEY && ZADARMA_API_SECRET),
+    odoo: !!(ODOO_BASE_URL && ODOO_API_KEY),
   });
 });
 
 /* =====================================================================
- *  PROMPTS IA
+ *  WHISPER — TRANSCRIPCIÓN DE AUDIO
+ *  Acepta una URL pública de audio (mp3/wav/ogg) y devuelve el texto.
+ * ===================================================================== */
+
+async function transcribeAudioUrl(audioUrl) {
+  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY para transcribir");
+  if (!audioUrl) throw new Error("transcribeAudioUrl: audioUrl vacío");
+
+  console.log("[Whisper] Descargando audio:", audioUrl);
+
+  // 1. Descargar el audio
+  const audioResp = await fetch(audioUrl, { redirect: "follow" });
+  if (!audioResp.ok) {
+    throw new Error(
+      `No se pudo descargar el audio (HTTP ${audioResp.status}): ${audioUrl}`
+    );
+  }
+
+  const audioBuffer = await audioResp.arrayBuffer();
+  const audioBlob = new Blob([audioBuffer], { type: "audio/mpeg" });
+
+  console.log(
+    "[Whisper] Audio descargado, tamaño:",
+    audioBuffer.byteLength,
+    "bytes"
+  );
+
+  // 2. Enviar a Whisper
+  const formData = new FormData();
+  formData.append("file", audioBlob, "recording.mp3");
+  formData.append("model", "whisper-1");
+  formData.append("language", "es");
+  formData.append("response_format", "text");
+
+  const whisperResp = await fetch(
+    "https://api.openai.com/v1/audio/transcriptions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: formData,
+    }
+  );
+
+  if (!whisperResp.ok) {
+    const errText = await whisperResp.text().catch(() => "");
+    throw new Error(`Whisper HTTP ${whisperResp.status}: ${errText}`);
+  }
+
+  const transcript = await whisperResp.text();
+  console.log(
+    "[Whisper] Transcripción OK, longitud:",
+    transcript.length,
+    "chars"
+  );
+  return transcript.trim();
+}
+
+/* =====================================================================
+ *  ZADARMA API — OBTENER URL DE GRABACIÓN
+ *  Zadarma manda NOTIFY_RECORD con call_id_with_rec.
+ *  Luego hay que pedir la URL de descarga a su API.
+ * ===================================================================== */
+
+function zadarmaSign(method, params, secret) {
+  // Firma HMAC-SHA1 requerida por la API de Zadarma
+  const sortedParams = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join("&");
+
+  const strToSign = `${method}${sortedParams}${crypto
+    .createHash("md5")
+    .update(sortedParams)
+    .digest("hex")}`;
+
+  return crypto
+    .createHmac("sha1", secret)
+    .update(strToSign)
+    .digest("base64");
+}
+
+async function getZadarmaRecordingUrl(callIdWithRec) {
+  if (!ZADARMA_API_KEY || !ZADARMA_API_SECRET) {
+    throw new Error("Faltan ZADARMA_API_KEY o ZADARMA_API_SECRET");
+  }
+
+  const method = "/v1/pbx/record/request/";
+  const params = {
+    call_id_with_rec: callIdWithRec,
+    lifetime: 180, // URL válida 3 minutos, suficiente para descargar
+  };
+
+  const sign = zadarmaSign(method, params, ZADARMA_API_SECRET);
+
+  const queryString = Object.keys(params)
+    .map((k) => `${k}=${encodeURIComponent(params[k])}`)
+    .join("&");
+
+  const url = `https://api.zadarma.com${method}?${queryString}`;
+
+  const resp = await fetch(url, {
+    headers: {
+      Authorization: `${ZADARMA_API_KEY}:${sign}`,
+    },
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`Zadarma API HTTP ${resp.status}: ${t}`);
+  }
+
+  const data = await resp.json();
+
+  if (data.status !== "success" || !data.link) {
+    throw new Error(
+      `Zadarma no devolvió link: ${JSON.stringify(data)}`
+    );
+  }
+
+  console.log("[Zadarma] URL grabación obtenida:", data.link);
+  return data.link;
+}
+
+/* =====================================================================
+ *  PROMPTS IA (sin cambios)
  * ===================================================================== */
 
 function buildSystemPrompt() {
@@ -108,7 +247,7 @@ function buildUserPrompt(text, meta) {
 }
 
 /* =====================================================================
- *  GEMINI JSON
+ *  GEMINI JSON (sin cambios)
  * ===================================================================== */
 
 async function callGeminiJSON(systemPrompt, userPrompt) {
@@ -196,7 +335,7 @@ function normalizeAIResult(parsed) {
 }
 
 /* =====================================================================
- *  ENDPOINT IA PURO
+ *  ENDPOINT IA PURO (sin cambios)
  * ===================================================================== */
 
 app.post("/lead/analyze", async (req, res) => {
@@ -262,7 +401,7 @@ app.post("/lead/analyze", async (req, res) => {
 });
 
 /* =====================================================================
- *  ODOO JSON-RPC helpers
+ *  ODOO JSON-RPC helpers (sin cambios)
  * ===================================================================== */
 
 async function odooJsonRpc(payload) {
@@ -330,7 +469,7 @@ async function odooExec(uid, model, method, args = [], kwargs = {}, id = 2) {
 }
 
 /* =====================================================================
- *  CONTACTOS / MÁQUINAS / HELP DESK
+ *  CONTACTOS / MÁQUINAS / HELPDESK (sin cambios)
  * ===================================================================== */
 
 function phoneLast9Digits(phone) {
@@ -373,12 +512,14 @@ async function getHelpdeskTeamId(uid) {
     12
   );
 
-  cachedHelpdeskTeamId = Array.isArray(teams) && teams.length ? teams[0].id : null;
+  cachedHelpdeskTeamId =
+    Array.isArray(teams) && teams.length ? teams[0].id : null;
   return cachedHelpdeskTeamId;
 }
 
 async function helpdeskTicketHasMachineField(uid) {
-  if (cachedHelpdeskHasMachineField !== null) return cachedHelpdeskHasMachineField;
+  if (cachedHelpdeskHasMachineField !== null)
+    return cachedHelpdeskHasMachineField;
 
   try {
     const fields = await odooExec(
@@ -397,7 +538,6 @@ async function helpdeskTicketHasMachineField(uid) {
 }
 
 async function findMachinesByPartner(uid, partnerId) {
-  // Según tu modelo: x_maquina_operador tiene x_cliente (Many2one a res.partner)
   try {
     const recs = await odooExec(
       uid,
@@ -421,7 +561,11 @@ async function postToMachineChatter(uid, machineId, bodyHtml) {
       "x_maquina_operador",
       "message_post",
       [[machineId]],
-      { body: bodyHtml, message_type: "comment", subtype_xmlid: "mail.mt_note" },
+      {
+        body: bodyHtml,
+        message_type: "comment",
+        subtype_xmlid: "mail.mt_note",
+      },
       21
     );
     return true;
@@ -432,8 +576,9 @@ async function postToMachineChatter(uid, machineId, bodyHtml) {
 }
 
 function looksLikeSupport(text) {
-  const t = String(text || "").toLowerCase();
-  return /(incidenc|aver[ií]a|fall[oa]|no funciona|error|alarma|bloquead|no vend|sensor|temperatura|pago|tpv|tarjeta)/i.test(t);
+  return /(incidenc|aver[ií]a|fall[oa]|no funciona|error|alarma|bloquead|no vend|sensor|temperatura|pago|tpv|tarjeta)/i.test(
+    text
+  );
 }
 
 function mapUrgencyToPriority(urg) {
@@ -450,7 +595,7 @@ async function findExistingByCallId(uid, model, callId) {
 }
 
 /* =====================================================================
- *  TAGS / PAÍS (reuso de tu lógica original)
+ *  TAGS / PAÍS (sin cambios)
  * ===================================================================== */
 
 async function getCountryIdByName(uid, countryName) {
@@ -525,13 +670,22 @@ function buildTagNames(ai, originalBody) {
   else if (urg === "media") tagNames.push("Urgencia: media");
   else if (urg === "baja") tagNames.push("Urgencia: baja");
 
-  const origen = (originalBody.origen || originalBody.source || "").toLowerCase();
+  const origen = (
+    originalBody.origen ||
+    originalBody.source ||
+    ""
+  ).toLowerCase();
   if (origen === "web") tagNames.push("Origen: web");
   else if (origen === "email") tagNames.push("Origen: email");
-  else if (origen === "telefono" || origen === "teléfono") tagNames.push("Origen: teléfono");
+  else if (origen === "telefono" || origen === "teléfono")
+    tagNames.push("Origen: teléfono");
   else if (origen === "cita") tagNames.push("Origen: cita");
 
-  const canal = (originalBody.canal || originalBody.channel || "").toLowerCase();
+  const canal = (
+    originalBody.canal ||
+    originalBody.channel ||
+    ""
+  ).toLowerCase();
   if (canal === "formulario") tagNames.push("Canal: formulario");
   else if (canal === "llamada") tagNames.push("Canal: llamada");
   else if (canal === "whatsapp") tagNames.push("Canal: WhatsApp");
@@ -543,37 +697,44 @@ function buildTagNames(ai, originalBody) {
   ) {
     tagNames.push("IA: Lead válido");
   }
-  if (!tagNames.some((n) => n.startsWith("IA:"))) tagNames.push("IA: Revisar manualmente");
+  if (!tagNames.some((n) => n.startsWith("IA:")))
+    tagNames.push("IA: Revisar manualmente");
 
   return Array.from(new Set(tagNames));
 }
 
 function buildSuggestedReply(ai, originalBody) {
   const nombre =
-    originalBody.nombre || originalBody.name || originalBody.contact_name || "Hola";
+    originalBody.nombre ||
+    originalBody.name ||
+    originalBody.contact_name ||
+    "Hola";
   const idioma = (ai.idioma || "es").toLowerCase();
   const intencion = (ai.intencion || "").toLowerCase();
   const urg = (ai.urgencia || "").toLowerCase();
   const pais = ai.pais || "";
   const datos = ai.datos_detectados || {};
   const ubicacion =
-    datos.ubicacion && String(datos.ubicacion).toLowerCase() !== "no especifica"
+    datos.ubicacion &&
+    String(datos.ubicacion).toLowerCase() !== "no especifica"
       ? String(datos.ubicacion)
       : "";
   const citaUrl = ODOO_APPOINTMENT_URL;
 
   const baseNombre = nombre ? `Hola ${nombre},` : "Hola,";
-
   const isSpanish = idioma === "es" || idioma === "ca";
 
   if (!isSpanish) {
     let msg = `${baseNombre} thank you for contacting us.\n\n`;
     if (["maquina", "operador", "ambos"].includes(intencion)) {
-      msg += "We will send you information about our vending machines and conditions.\n";
+      msg +=
+        "We will send you information about our vending machines and conditions.\n";
     } else if (intencion === "pizzas") {
-      msg += "We will send you information about our catalog, formats and prices.\n";
+      msg +=
+        "We will send you information about our catalog, formats and prices.\n";
     } else if (intencion === "soporte") {
-      msg += "We have received your technical support request and we'll review it ASAP.\n";
+      msg +=
+        "We have received your technical support request and we'll review it ASAP.\n";
     } else {
       msg += "We will reply with the information you requested.\n";
     }
@@ -591,19 +752,22 @@ function buildSuggestedReply(ai, originalBody) {
     else if (pais && pais !== "Desconocido") msg += ` en ${pais}`;
     msg += ". Te enviaremos una propuesta adaptada a tu caso.\n";
   } else if (intencion === "pizzas") {
-    msg += "Hemos recibido tu interés por nuestras pizzas. Te enviaremos catálogo y condiciones.\n";
+    msg +=
+      "Hemos recibido tu interés por nuestras pizzas. Te enviaremos catálogo y condiciones.\n";
   } else if (intencion === "soporte") {
     msg +=
       "Hemos recibido tu consulta de soporte técnico. Vamos a revisar el caso y te daremos los pasos a seguir lo antes posible.\n";
   } else if (intencion === "info") {
-    msg += "Hemos recibido tu consulta y te responderemos con la información que necesitas.\n";
+    msg +=
+      "Hemos recibido tu consulta y te responderemos con la información que necesitas.\n";
   } else {
-    msg += "Hemos recibido tu mensaje y lo revisaremos para darte la mejor respuesta.\n";
+    msg +=
+      "Hemos recibido tu mensaje y lo revisaremos para darte la mejor respuesta.\n";
   }
 
   const puedeOfrecerCita =
     citaUrl &&
-    (["maquina", "operador", "ambos", "info"].includes(intencion)) &&
+    ["maquina", "operador", "ambos", "info"].includes(intencion) &&
     urg !== "baja";
 
   if (puedeOfrecerCita) {
@@ -616,7 +780,7 @@ function buildSuggestedReply(ai, originalBody) {
 }
 
 /* =====================================================================
- *  CREAR LEAD (con partner_id)
+ *  CREAR LEAD (sin cambios)
  * ===================================================================== */
 
 async function createOdooLead(ai, originalBody) {
@@ -630,10 +794,8 @@ async function createOdooLead(ai, originalBody) {
 
   const emailFrom = originalBody.email || originalBody.email_from || "";
   const phone = originalBody.phone || originalBody.telefono || "";
-
   const origin = originalBody.origen || originalBody.source || "";
   const channel = originalBody.canal || originalBody.channel || "";
-
   const textoOriginal =
     originalBody.text ||
     originalBody.mensaje ||
@@ -653,13 +815,10 @@ async function createOdooLead(ai, originalBody) {
   else if (urg === "media") priority = "2";
 
   const countryId = await getCountryIdByName(uid, ai.pais);
-
   const tagNames = buildTagNames(ai, originalBody);
   const tagIds = await getTagIdsByNames(uid, tagNames);
-
   const suggestedReply = buildSuggestedReply(ai, originalBody);
 
-  // Vincular al partner por teléfono (historial por contacto)
   const partnerId = await findOrCreatePartner(uid, {
     name: partnerName,
     phone,
@@ -704,18 +863,25 @@ Canal: ${channel}
 }
 
 /* =====================================================================
- *  CREAR TICKET SAT (helpdesk.ticket)
+ *  CREAR TICKET SAT (sin cambios)
  * ===================================================================== */
 
 async function createHelpdeskTicket(ai, enrichedBody, transcript, callId) {
   const uid = await authenticateOdoo();
 
-  // Idempotencia si viene call_id
   const existing = await findExistingByCallId(uid, "helpdesk.ticket", callId);
   if (existing) return { ticketId: existing, reused: true, machineIds: [] };
 
-  const callerName = enrichedBody.caller_name || enrichedBody.nombre || enrichedBody.name || "Llamada";
-  const callerPhone = enrichedBody.caller_id || enrichedBody.phone || enrichedBody.telefono || "";
+  const callerName =
+    enrichedBody.caller_name ||
+    enrichedBody.nombre ||
+    enrichedBody.name ||
+    "Llamada";
+  const callerPhone =
+    enrichedBody.caller_id ||
+    enrichedBody.phone ||
+    enrichedBody.telefono ||
+    "";
   const email = enrichedBody.email || "";
 
   const partnerId = await findOrCreatePartner(uid, {
@@ -725,22 +891,38 @@ async function createHelpdeskTicket(ai, enrichedBody, transcript, callId) {
   });
 
   const teamId = await getHelpdeskTeamId(uid);
-  const machines = partnerId ? await findMachinesByPartner(uid, partnerId) : [];
+  const machines = partnerId
+    ? await findMachinesByPartner(uid, partnerId)
+    : [];
 
   const soporteTipo = ai?.soporte?.tipo || "no especifica";
   const sintoma = ai?.soporte?.error_o_sintoma || "no especifica";
-  const pasos = Array.isArray(ai?.soporte?.pasos_sugeridos) ? ai.soporte.pasos_sugeridos : [];
+  const pasos = Array.isArray(ai?.soporte?.pasos_sugeridos)
+    ? ai.soporte.pasos_sugeridos
+    : [];
 
-  const pasosTxt = pasos.length ? pasos.map((p, i) => `${i + 1}. ${p}`).join("\n") : "No hay pasos sugeridos";
+  const pasosTxt = pasos.length
+    ? pasos.map((p, i) => `${i + 1}. ${p}`).join("\n")
+    : "No hay pasos sugeridos";
 
-  const candidatesTxt =
-    machines.length
-      ? machines.map((m) => `- ${m.name} (id=${m.id}${m.x_studio_x_machine_uid ? `, uid=${m.x_studio_x_machine_uid}` : ""})`).join("\n")
-      : "- No localizada por partner";
+  const candidatesTxt = machines.length
+    ? machines
+        .map(
+          (m) =>
+            `- ${m.name} (id=${m.id}${
+              m.x_studio_x_machine_uid
+                ? `, uid=${m.x_studio_x_machine_uid}`
+                : ""
+            })`
+        )
+        .join("\n")
+    : "- No localizada por partner";
 
   const machineUnique = machines.length === 1 ? machines[0] : null;
 
-  const ticketName = ai?.resumen ? `[SAT] ${ai.resumen}` : `[SAT] Incidencia telefónica ${callerPhone}`.trim();
+  const ticketName = ai?.resumen
+    ? `[SAT] ${ai.resumen}`
+    : `[SAT] Incidencia telefónica ${callerPhone}`.trim();
 
   const description = `
 call_id=${callId || "no"}
@@ -772,19 +954,24 @@ ${transcript}
     description,
     partner_id: partnerId || undefined,
     team_id: teamId || undefined,
-    user_id: uid, // tú (único usuario)
+    user_id: uid,
     priority: mapUrgencyToPriority(ai?.urgencia || "media"),
   };
 
-  // Si tienes el campo x_maquina_id en helpdesk.ticket, lo rellenamos solo si hay match único
   const hasMachineField = await helpdeskTicketHasMachineField(uid);
   if (hasMachineField && machineUnique) {
     vals.x_maquina_id = machineUnique.id;
   }
 
-  const ticketId = await odooExec(uid, "helpdesk.ticket", "create", [[vals]], {}, 60);
+  const ticketId = await odooExec(
+    uid,
+    "helpdesk.ticket",
+    "create",
+    [[vals]],
+    {},
+    60
+  );
 
-  // Nota en el chatter de la máquina (solo si match único; si hay varias, no ensuciamos)
   if (machineUnique) {
     const ticketUrl = `${ODOO_BASE_URL}/web#id=${ticketId}&model=helpdesk.ticket&view_type=form`;
     const noteHtml = `
@@ -796,11 +983,15 @@ ${transcript}
     await postToMachineChatter(uid, machineUnique.id, noteHtml);
   }
 
-  return { ticketId, reused: false, machineIds: machineUnique ? [machineUnique.id] : [] };
+  return {
+    ticketId,
+    reused: false,
+    machineIds: machineUnique ? [machineUnique.id] : [],
+  };
 }
 
 /* =====================================================================
- *  ENDPOINT IA + CREACIÓN LEAD (se mantiene)
+ *  ENDPOINT IA + CREACIÓN LEAD (sin cambios)
  * ===================================================================== */
 
 app.post("/lead/analyze-and-create", async (req, res) => {
@@ -829,7 +1020,6 @@ app.post("/lead/analyze-and-create", async (req, res) => {
       buildUserPrompt(String(text), meta)
     );
     const ai = normalizeAIResult(parsed);
-
     const leadId = await createOdooLead(ai, body);
 
     return res.json({
@@ -862,15 +1052,185 @@ app.post("/lead/analyze-and-create", async (req, res) => {
 });
 
 /* =====================================================================
- *  WEBHOOK ZADARMA — TRANSCRIPCIÓN DE LLAMADAS
- *  NUEVO:
- *   - Si soporte => helpdesk.ticket
- *   - Si no => crm.lead
+ *  WEBHOOK ZADARMA — NOTIFY_RECORD (NUEVO ✨)
+ *
+ *  Zadarma llama a este endpoint cuando la grabación está lista.
+ *  Pasos:
+ *   1. Recibe call_id_with_rec de Zadarma
+ *   2. Pide la URL de descarga a la API de Zadarma
+ *   3. Descarga el audio y transcribe con Whisper (OpenAI)
+ *   4. Analiza la transcripción con Gemini
+ *   5. Crea lead o ticket en Odoo según la intención detectada
+ *
+ *  Configura en Zadarma:
+ *    Panel → PBX → Notificaciones → URL del webhook → POST
+ *    URL: https://odoo-ai-connector.onrender.com/webhooks/zadarma/notify_record
+ * ===================================================================== */
+
+app.post("/webhooks/zadarma/notify_record", async (req, res) => {
+  // Zadarma puede mandar JSON o form-urlencoded
+  const body = req.body || {};
+
+  console.log("[Zadarma NOTIFY_RECORD] Payload recibido:", JSON.stringify(body));
+
+  // Verificación de seguridad opcional
+  if (SECURITY_TOKEN && body.zd_echo !== undefined) {
+    // Zadarma hace una petición de verificación al configurar el webhook
+    return res.send(body.zd_echo);
+  }
+
+  // Solo procesamos eventos de grabación
+  const event = body.event || body.notification_type || "";
+  if (event && event !== "NOTIFY_RECORD" && event !== "notify_record") {
+    console.log("[Zadarma] Evento ignorado:", event);
+    return res.json({ ok: true, skipped: true, event });
+  }
+
+  const callIdWithRec =
+    body.call_id_with_rec ||
+    body.callIdWithRec ||
+    body.call_id ||
+    null;
+
+  if (!callIdWithRec) {
+    console.warn("[Zadarma] NOTIFY_RECORD sin call_id_with_rec:", body);
+    return res.status(400).json({
+      ok: false,
+      service: SERVICE_NAME,
+      error: "missing_call_id_with_rec",
+      message: "El webhook no incluye call_id_with_rec.",
+    });
+  }
+
+  // Respondemos rápido a Zadarma (tienen timeout corto)
+  res.json({ ok: true, service: SERVICE_NAME, received: callIdWithRec });
+
+  // Procesamos de forma asíncrona para no bloquear la respuesta
+  setImmediate(async () => {
+    try {
+      // Zadarma recomienda esperar ~40s antes de pedir la grabación
+      console.log("[Zadarma] Esperando 45s antes de pedir grabación...");
+      await new Promise((r) => setTimeout(r, 45000));
+
+      // 1. Obtener URL del audio
+      const audioUrl = await getZadarmaRecordingUrl(callIdWithRec);
+
+      // 2. Transcribir con Whisper
+      const transcript = await transcribeAudioUrl(audioUrl);
+
+      if (!transcript || transcript.trim().length < 5) {
+        console.warn("[Zadarma] Transcripción vacía o muy corta, descartando.");
+        return;
+      }
+
+      console.log("[Zadarma] Transcripción obtenida:", transcript.slice(0, 200), "...");
+
+      // 3. Enriquecer con datos del payload de Zadarma
+      const enrichedBody = {
+        ...body,
+        text: transcript,
+        origen: "telefono",
+        canal: "llamada",
+        nombre: body.caller_name || body.name || null,
+        phone: body.caller_id || body.from || body.phone || null,
+      };
+
+      const meta = {
+        origen: "telefono",
+        canal: "llamada",
+        nombre: enrichedBody.nombre,
+        email: enrichedBody.email || null,
+      };
+
+      // 4. Analizar con Gemini
+      const parsed = await callGeminiJSON(
+        buildSystemPrompt(),
+        buildUserPrompt(transcript, meta)
+      );
+      const ai = normalizeAIResult(parsed);
+
+      console.log("[Zadarma] Análisis IA:", ai.intencion, "|", ai.resumen);
+
+      // 5. Crear en Odoo: ticket si es soporte, lead si no
+      const shouldCreateTicket =
+        ai.intencion === "soporte" ||
+        looksLikeSupport(transcript) ||
+        String(body.force_ticket || "").toLowerCase() === "true";
+
+      if (shouldCreateTicket) {
+        const r = await createHelpdeskTicket(
+          ai,
+          enrichedBody,
+          transcript,
+          callIdWithRec
+        );
+        console.log(
+          `[Zadarma] Ticket creado en Odoo: #${r.ticketId} (reused=${r.reused})`
+        );
+      } else {
+        const leadId = await createOdooLead(ai, enrichedBody);
+        console.log(`[Zadarma] Lead creado en Odoo: #${leadId}`);
+      }
+    } catch (err) {
+      console.error("[Zadarma NOTIFY_RECORD] Error en procesamiento:", err.message);
+
+      // Fallback: crear ticket básico para no perder la llamada
+      try {
+        const aiFallback = {
+          intencion: "soporte",
+          urgencia: "media",
+          resumen: "Llamada sin clasificar (error en procesamiento IA)",
+          soporte: {
+            tipo: "no especifica",
+            error_o_sintoma: err.message,
+            pasos_sugeridos: [],
+          },
+          datos_detectados: {},
+        };
+        const enrichedFallback = {
+          ...req.body,
+          text: `Error: ${err.message}`,
+          origen: "telefono",
+          canal: "llamada",
+          phone: req.body?.caller_id || req.body?.from || null,
+        };
+        const r = await createHelpdeskTicket(
+          aiFallback,
+          enrichedFallback,
+          `[ERROR DE PROCESAMIENTO] ${err.message}`,
+          callIdWithRec
+        );
+        console.log(`[Zadarma] Ticket fallback creado: #${r.ticketId}`);
+      } catch (e2) {
+        console.error("[Zadarma] Fallback también falló:", e2.message);
+      }
+    }
+  });
+});
+
+/* =====================================================================
+ *  WEBHOOK ZADARMA LEGACY — /webhooks/zadarma/call
+ *  Se mantiene por compatibilidad. Acepta transcript ya hecho
+ *  o audio_url para transcribir en el momento.
  * ===================================================================== */
 
 app.post("/webhooks/zadarma/call", async (req, res) => {
   const body = req.body || {};
-  const transcript = body.transcript || body.text || body.mensaje || body.message || "";
+
+  // Si viene audio_url, transcribimos primero
+  const audioUrl =
+    body.audio_url || body.recording_url || body.record_url || null;
+
+  let transcript =
+    body.transcript || body.text || body.mensaje || body.message || "";
+
+  if (!transcript && audioUrl) {
+    try {
+      transcript = await transcribeAudioUrl(audioUrl);
+    } catch (e) {
+      console.error("[/webhooks/zadarma/call] Error transcribiendo:", e.message);
+    }
+  }
 
   if (!String(transcript || "").trim()) {
     return res.status(400).json({
@@ -878,11 +1238,11 @@ app.post("/webhooks/zadarma/call", async (req, res) => {
       service: SERVICE_NAME,
       source: "zadarma",
       error: "missing_transcript",
-      message: "Debes enviar 'transcript' (o 'text'/'mensaje') con la transcripción.",
+      message:
+        "Debes enviar 'transcript' (o 'text'/'mensaje') con la transcripción, o 'audio_url' para transcribir automáticamente.",
     });
   }
 
-  // Identificador de llamada (si Zadarma lo manda)
   const callId =
     body.call_id ||
     body.callid ||
@@ -915,10 +1275,17 @@ app.post("/webhooks/zadarma/call", async (req, res) => {
     const ai = normalizeAIResult(parsed);
 
     const shouldCreateTicket =
-      ai.intencion === "soporte" || looksLikeSupport(transcript) || String(body.force_ticket || "").toLowerCase() === "true";
+      ai.intencion === "soporte" ||
+      looksLikeSupport(transcript) ||
+      String(body.force_ticket || "").toLowerCase() === "true";
 
     if (shouldCreateTicket) {
-      const r = await createHelpdeskTicket(ai, enrichedBody, transcript, callId);
+      const r = await createHelpdeskTicket(
+        ai,
+        enrichedBody,
+        transcript,
+        callId
+      );
       return res.json({
         ok: true,
         service: SERVICE_NAME,
@@ -927,7 +1294,11 @@ app.post("/webhooks/zadarma/call", async (req, res) => {
         ticket_id: r.ticketId,
         reused: r.reused,
         machine_ids: r.machineIds,
-        ai: { intencion: ai.intencion, urgencia: ai.urgencia, resumen: ai.resumen },
+        ai: {
+          intencion: ai.intencion,
+          urgencia: ai.urgencia,
+          resumen: ai.resumen,
+        },
       });
     }
 
@@ -938,22 +1309,34 @@ app.post("/webhooks/zadarma/call", async (req, res) => {
       source: "zadarma",
       created: "lead",
       lead_id: leadId,
-      ai: { intencion: ai.intencion, urgencia: ai.urgencia, resumen: ai.resumen },
+      ai: {
+        intencion: ai.intencion,
+        urgencia: ai.urgencia,
+        resumen: ai.resumen,
+      },
     });
   } catch (err) {
     console.error("[/webhooks/zadarma/call] Error:", err.message);
 
-    // Fallback: si falla IA, creamos ticket básico para no perder incidencias
     try {
       const aiFallback = {
         intencion: "soporte",
         urgencia: "media",
         resumen: "Llamada SAT sin clasificar (fallo IA)",
-        soporte: { tipo: "no especifica", error_o_sintoma: "no especifica", pasos_sugeridos: [] },
+        soporte: {
+          tipo: "no especifica",
+          error_o_sintoma: "no especifica",
+          pasos_sugeridos: [],
+        },
         datos_detectados: {},
       };
 
-      const r = await createHelpdeskTicket(aiFallback, enrichedBody, transcript, callId);
+      const r = await createHelpdeskTicket(
+        aiFallback,
+        enrichedBody,
+        transcript,
+        callId
+      );
       return res.status(200).json({
         ok: true,
         service: SERVICE_NAME,
@@ -984,12 +1367,18 @@ app.get("/", (req, res) => {
     ok: true,
     service: SERVICE_NAME,
     version: VERSION,
-    message: "Usa GET /health o POST /lead/analyze",
+    endpoints: {
+      health: "GET /health",
+      analyze: "POST /lead/analyze",
+      analyzeAndCreate: "POST /lead/analyze-and-create",
+      zadarmaRecord: "POST /webhooks/zadarma/notify_record  ← NUEVO principal",
+      zadarmaCall: "POST /webhooks/zadarma/call  ← legacy, sigue funcionando",
+    },
   });
 });
 
 // 🚀 Arranque
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${SERVICE_NAME}] v${VERSION} escuchando en puerto ${PORT}`);
+  console.log(`[${SERVICE_NAME}] ${VERSION} escuchando en puerto ${PORT}`);
 });
