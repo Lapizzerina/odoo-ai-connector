@@ -1,6 +1,6 @@
 // index.js — odoo-ai-connector + Gemini + Whisper + Odoo + Zadarma
 // Node 18+ (Render) — usa fetch nativo
-// v2.1.0 — Fix verificación zd_echo de Zadarma (GET query string)
+// v2.2.0 — Fix firma HMAC-SHA1 Zadarma (codificación RFC1738 correcta)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -8,7 +8,7 @@ const crypto = require("crypto");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v2.1.0";
+const VERSION = "v2.2.0";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -133,21 +133,27 @@ async function transcribeAudioUrl(audioUrl) {
  * ===================================================================== */
 
 function zadarmaSign(method, params, secret) {
-  // Firma HMAC-SHA1 requerida por la API de Zadarma
-  const sortedParams = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
+  // Firma HMAC-SHA1 según documentación oficial de Zadarma:
+  // 1. Ordenar parámetros alfabéticamente (ksort)
+  // 2. Construir query string con codificación RFC1738 (espacios como +)
+  // 3. sign = base64(hmac_sha1(method + paramsStr + md5(paramsStr), secret))
+
+  const sortedKeys = Object.keys(params).sort();
+
+  // RFC1738: encodeURIComponent pero espacios como + y sin codificar ~
+  const rfc1738 = (str) =>
+    encodeURIComponent(String(str))
+      .replace(/%20/g, "+")
+      .replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+
+  const paramsStr = sortedKeys
+    .map((k) => `${rfc1738(k)}=${rfc1738(params[k])}`)
     .join("&");
 
-  const strToSign = `${method}${sortedParams}${crypto
-    .createHash("md5")
-    .update(sortedParams)
-    .digest("hex")}`;
+  const md5ofParams = crypto.createHash("md5").update(paramsStr).digest("hex");
+  const strToSign = `${method}${paramsStr}${md5ofParams}`;
 
-  return crypto
-    .createHmac("sha1", secret)
-    .update(strToSign)
-    .digest("base64");
+  return crypto.createHmac("sha1", secret).update(strToSign).digest("base64");
 }
 
 async function getZadarmaRecordingUrl(callIdWithRec) {
@@ -156,40 +162,55 @@ async function getZadarmaRecordingUrl(callIdWithRec) {
   }
 
   const method = "/v1/pbx/record/request/";
+
+  // Parámetros ordenados alfabéticamente
   const params = {
-    call_id_with_rec: callIdWithRec,
-    lifetime: 180, // URL válida 3 minutos, suficiente para descargar
+    call_id_with_rec: String(callIdWithRec),
+    lifetime: "180",
   };
 
   const sign = zadarmaSign(method, params, ZADARMA_API_SECRET);
 
-  const queryString = Object.keys(params)
+  // Query string para la URL (mismo orden que la firma)
+  const sortedKeys = Object.keys(params).sort();
+  const queryString = sortedKeys
     .map((k) => `${k}=${encodeURIComponent(params[k])}`)
     .join("&");
 
   const url = `https://api.zadarma.com${method}?${queryString}`;
 
+  console.log("[Zadarma] Pidiendo grabación, URL:", url);
+
   const resp = await fetch(url, {
     headers: {
       Authorization: `${ZADARMA_API_KEY}:${sign}`,
+      Accept: "application/json",
     },
   });
 
+  const responseText = await resp.text();
+  console.log("[Zadarma] Respuesta API:", resp.status, responseText.slice(0, 300));
+
   if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    throw new Error(`Zadarma API HTTP ${resp.status}: ${t}`);
+    throw new Error(`Zadarma API HTTP ${resp.status}: ${responseText}`);
   }
 
-  const data = await resp.json();
-
-  if (data.status !== "success" || !data.link) {
-    throw new Error(
-      `Zadarma no devolvió link: ${JSON.stringify(data)}`
-    );
+  let data;
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    throw new Error(`Zadarma respuesta no es JSON: ${responseText}`);
   }
 
-  console.log("[Zadarma] URL grabación obtenida:", data.link);
-  return data.link;
+  // La API puede devolver "link" (string) o "links" (array)
+  const link = data.link || (Array.isArray(data.links) && data.links[0]) || null;
+
+  if (data.status !== "success" || !link) {
+    throw new Error(`Zadarma no devolvió link: ${JSON.stringify(data)}`);
+  }
+
+  console.log("[Zadarma] URL grabación obtenida:", link);
+  return link;
 }
 
 /* =====================================================================
