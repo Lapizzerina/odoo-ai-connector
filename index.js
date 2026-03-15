@@ -1,66 +1,50 @@
-// index.js — odoo-ai-connector v3.0.0
+// index.js — odoo-ai-connector v3.3.1
 // Piznalia / La Pizzerina / SmartChef24h
 // Node 18+ (Render) — fetch nativo
 //
-// FLUJO:
-//  1. Zadarma NOTIFY_END  → guarda internal (extensión) en memoria
-//  2. Zadarma NOTIFY_RECORD → descarga audio, transcribe (Whisper),
-//                             resume + clasifica (Gemini),
-//                             crea lead o ticket en Odoo
+// FLUJO PRINCIPAL:
+//  1. Zadarma NOTIFY_END    → guarda extensión en cache
+//  2. Zadarma NOTIFY_RECORD → espera 60s → busca audio en Odoo (ir.attachment)
+//                           → Gemini analiza audio directamente (transcribe+clasifica)
+//                           → si falla por tamaño → Whisper transcribe + Gemini analiza texto
+//                           → crea lead/ticket/nota en Odoo
 //
-// LÓGICA IA:
-//  - IA decide si es "lead" o "ticket"
-//  - ticket solo si cliente tiene máquina en x_maquina_operador
-//  - si no tiene máquina → lead siempre
-//  - extensión se guarda como dato informativo, no condiciona
+// COSTE: 0€ (Gemini gratis) + ~2€/mes solo si se activa fallback Whisper
 
 const express = require("express");
 const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.2.1";
+const VERSION      = "v3.3.1";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
-const ODOO_BASE_URL          = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
-const ODOO_DB                = process.env.ODOO_DB || "";
-const ODOO_USER_EMAIL        = process.env.ODOO_USER_EMAIL || "";
-const ODOO_API_KEY           = process.env.ODOO_API_KEY || "";
-const ODOO_APPOINTMENT_URL   = process.env.ODOO_APPOINTMENT_URL || "";
+const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
+const ODOO_DB                 = process.env.ODOO_DB || "";
+const ODOO_USER_EMAIL         = process.env.ODOO_USER_EMAIL || "";
+const ODOO_API_KEY            = process.env.ODOO_API_KEY || "";
+const ODOO_APPOINTMENT_URL    = process.env.ODOO_APPOINTMENT_URL || "";
 const ODOO_HELPDESK_TEAM_NAME = process.env.ODOO_HELPDESK_TEAM_NAME || "Atención al cliente";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL   = process.env.GEMINI_MODEL   || "gemini-2.5-flash";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // solo fallback Whisper
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-
-const ZADARMA_API_KEY    = process.env.ZADARMA_API_KEY    || "";
-const ZADARMA_API_SECRET = process.env.ZADARMA_API_SECRET || "";
-
-// ── CACHE ────────────────────────────────────────────────────────────────────
-let cachedOdooUid             = null;
-let cachedHelpdeskTeamId      = null;
-
-// Guarda el internal (extensión) de NOTIFY_END para usarlo en NOTIFY_RECORD
-// clave: pbx_call_id → valor: { internal, caller_id, ttl }
+// ── CACHE (extensión por llamada) ────────────────────────────────────────────
 const callCache = new Map();
-const CALL_CACHE_TTL = 10 * 60 * 1000; // 10 minutos
+const CALL_CACHE_TTL = 10 * 60 * 1000;
 
 function cacheSet(pbxCallId, data) {
   callCache.set(pbxCallId, { ...data, ttl: Date.now() + CALL_CACHE_TTL });
 }
 function cacheGet(pbxCallId) {
-  const entry = callCache.get(pbxCallId);
-  if (!entry) return null;
-  if (Date.now() > entry.ttl) { callCache.delete(pbxCallId); return null; }
-  return entry;
+  const e = callCache.get(pbxCallId);
+  if (!e) return null;
+  if (Date.now() > e.ttl) { callCache.delete(pbxCallId); return null; }
+  return e;
 }
-// Limpieza periódica del cache
 setInterval(() => {
   const now = Date.now();
-  for (const [k, v] of callCache.entries()) {
-    if (now > v.ttl) callCache.delete(k);
-  }
+  for (const [k, v] of callCache.entries()) if (now > v.ttl) callCache.delete(k);
 }, 5 * 60 * 1000);
 
 // ── MIDDLEWARE ───────────────────────────────────────────────────────────────
@@ -77,313 +61,33 @@ app.use((req, res, next) => {
 // ── HEALTH ───────────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({
   ok: true, service: SERVICE_NAME, version: VERSION,
-  whisper: !!OPENAI_API_KEY, gemini: !!GEMINI_API_KEY,
-  zadarma: !!(ZADARMA_API_KEY && ZADARMA_API_SECRET),
-  odoo: !!(ODOO_BASE_URL && ODOO_API_KEY),
+  gemini:           !!GEMINI_API_KEY,
+  whisper_fallback: !!OPENAI_API_KEY,
+  odoo:             !!(ODOO_BASE_URL && ODOO_API_KEY),
 }));
 
 app.get("/", (req, res) => res.json({
   ok: true, service: SERVICE_NAME, version: VERSION,
   endpoints: {
-    health:         "GET  /health",
-    notifyRecord:   "POST /webhooks/zadarma/notify_record  ← principal",
-    analyzeOnly:    "POST /lead/analyze",
-    analyzeCreate:  "POST /lead/analyze-and-create",
+    health:        "GET  /health",
+    webhook:       "POST /webhooks/zadarma/notify_record",
+    analyze:       "POST /lead/analyze",
+    analyzeCreate: "POST /lead/analyze-and-create",
   },
 }));
 
 // ════════════════════════════════════════════════════════════════════════════
-//  WHISPER — transcripción de audio
-// ════════════════════════════════════════════════════════════════════════════
-async function transcribeAudioBuffer(buffer, filename, mimetype) {
-  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
-
-  const formData = new FormData();
-  formData.append("file", new Blob([buffer], { type: mimetype || "audio/ogg" }), filename || "recording.ogg");
-  formData.append("model", "whisper-1");
-  formData.append("language", "es");
-  formData.append("response_format", "text");
-
-  const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: formData,
-  });
-
-  if (!resp.ok) {
-    const err = await resp.text().catch(() => "");
-    throw new Error(`Whisper HTTP ${resp.status}: ${err}`);
-  }
-
-  const text = (await resp.text()).trim();
-  console.log("[Whisper] Transcripción OK, chars:", text.length);
-  return text;
-}
-
-async function transcribeAudioUrl(audioUrl) {
-  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY");
-  console.log("[Whisper] Descargando audio:", audioUrl);
-
-  const audioResp = await fetch(audioUrl, { redirect: "follow" });
-  if (!audioResp.ok) throw new Error(`No se pudo descargar audio (HTTP ${audioResp.status})`);
-
-  const audioBuffer = await audioResp.arrayBuffer();
-  console.log("[Whisper] Audio descargado:", audioBuffer.byteLength, "bytes");
-
-  const formData = new FormData();
-  formData.append("file", new Blob([audioBuffer], { type: "audio/mpeg" }), "recording.mp3");
-  formData.append("model", "whisper-1");
-  formData.append("language", "es");
-  formData.append("response_format", "text");
-
-  const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: formData,
-  });
-
-  if (!resp.ok) {
-    const err = await resp.text().catch(() => "");
-    throw new Error(`Whisper HTTP ${resp.status}: ${err}`);
-  }
-
-  const text = (await resp.text()).trim();
-  console.log("[Whisper] Transcripción OK, chars:", text.length);
-  return text;
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  ZADARMA API — firma HMAC (mantenida por si acaso, no se usa en flujo principal)
-// ════════════════════════════════════════════════════════════════════════════
-function zadarmaSign(method, params, secret) {
-  // Implementación EXACTA del PHP oficial de Zadarma (Client.php):
-  // $paramsString = http_build_query($params);  ← SIN ordenar
-  // PHP_QUERY_RFC1738: no codifica letras, números, _ - . ~
-  // encodeURIComponent codifica el punto (.) → hay que revertirlo
-  const phpEncode = s => encodeURIComponent(String(s)).replace(/%2E/gi, ".");
-  const paramsStr = Object.keys(params)
-    .map(k => `${phpEncode(k)}=${phpEncode(params[k])}`)
-    .join("&");
-  const md5str  = crypto.createHash("md5").update(paramsStr).digest("hex");
-  const toSign  = method + paramsStr + md5str;
-  console.log("[Zadarma Sign] paramsStr:", paramsStr);
-  console.log("[Zadarma Sign] toSign:", toSign.slice(0, 120));
-  return crypto.createHmac("sha1", secret).update(toSign).digest("base64");
-}
-
-async function getZadarmaRecordingUrl(callIdWithRec) {
-  if (!ZADARMA_API_KEY || !ZADARMA_API_SECRET) throw new Error("Faltan claves Zadarma");
-
-  const method = "/v1/pbx/record/request/";
-  // Orden exacto igual que el paramsStr de la firma
-  const params = { call_id_with_rec: String(callIdWithRec), lifetime: "180" };
-  const sign   = zadarmaSign(method, params, ZADARMA_API_SECRET);
-
-  const qs  = Object.keys(params).map(k => `${k}=${encodeURIComponent(params[k])}`).join("&");
-  const url = `https://api.zadarma.com${method}?${qs}`;
-
-  console.log("[Zadarma API] GET", url);
-  const resp = await fetch(url, {
-    headers: { Authorization: `${ZADARMA_API_KEY}:${sign}`, Accept: "application/json" },
-  });
-
-  const raw = await resp.text();
-  console.log("[Zadarma API] Status:", resp.status, "Body:", raw.slice(0, 300));
-
-  if (!resp.ok) throw new Error(`Zadarma HTTP ${resp.status}: ${raw}`);
-
-  const data = JSON.parse(raw);
-  const link = data.link || (Array.isArray(data.links) && data.links[0]) || null;
-  if (data.status !== "success" || !link) throw new Error(`Sin link: ${raw}`);
-
-  return link;
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  ODOO ATTACHMENTS — buscar y descargar audio desde Odoo
-//  Zadarma sube el audio como ir.attachment en res.partner
-//  El nombre del fichero contiene el call_id_with_rec
-// ════════════════════════════════════════════════════════════════════════════
-
-async function getOdooSessionCookie() {
-  // Odoo /web/content requiere sesión autenticada, no API key Bearer
-  // Usamos el endpoint de autenticación web para obtener una cookie de sesión
-  const resp = await fetch(`${ODOO_BASE_URL}/web/dataset/call_kw`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0", method: "call", id: 99,
-      params: {
-        model: "res.users", method: "read",
-        args: [[1]], kwargs: { fields: ["name"] },
-        kwargs_: {},
-      },
-    }),
-  });
-  // Extraer cookie de sesión de la respuesta
-  const setCookie = resp.headers.get("set-cookie") || "";
-  const match = setCookie.match(/session_id=([^;]+)/);
-  return match ? match[1] : null;
-}
-
-async function getAudioFromOdoo(uid, callIdWithRec) {
-  console.log("[Odoo Audio] Buscando adjunto para call_id:", callIdWithRec);
-
-  const attachments = await odooExec(uid, "ir.attachment", "search_read",
-    [[["name", "ilike", callIdWithRec]]],
-    { fields: ["id", "name", "mimetype", "datas", "res_model", "res_id"], limit: 5 }, 90
-  );
-
-  if (!attachments || attachments.length === 0) {
-    throw new Error(`No se encontró adjunto para call_id_with_rec: ${callIdWithRec}`);
-  }
-
-  const attachment = attachments[0];
-  console.log(`[Odoo Audio] Adjunto encontrado: id=${attachment.id} nombre=${attachment.name} mime=${attachment.mimetype}`);
-
-  // Método 1: leer el contenido base64 directamente via JSON-RPC (más fiable)
-  if (attachment.datas && attachment.datas.length > 0) {
-    console.log("[Odoo Audio] Usando datas base64 directamente");
-    const buffer = Buffer.from(attachment.datas, "base64");
-    console.log("[Odoo Audio] Audio decodificado:", buffer.byteLength, "bytes");
-    return { buffer, mimetype: attachment.mimetype || "audio/ogg", attachmentId: attachment.id };
-  }
-
-  // Método 2: descargar via HTTP con access_token
-  // Odoo genera access_token para adjuntos
-  const tokenResp = await odooExec(uid, "ir.attachment", "read",
-    [[attachment.id]], { fields: ["id", "name", "mimetype", "datas"] }, 91
-  );
-
-  if (tokenResp && tokenResp[0] && tokenResp[0].datas) {
-    const buffer = Buffer.from(tokenResp[0].datas, "base64");
-    console.log("[Odoo Audio] Audio via read():", buffer.byteLength, "bytes");
-    return { buffer, mimetype: attachment.mimetype || "audio/ogg", attachmentId: attachment.id };
-  }
-
-  throw new Error(`No se pudo obtener el contenido del adjunto id=${attachment.id}`);
-}
-
-async function transcribeFromOdoo(uid, callIdWithRec) {
-  // Esperar a que Zadarma suba el audio a Odoo
-  console.log("[Odoo Audio] Esperando 30s para que Zadarma suba el audio a Odoo...");
-  await new Promise(r => setTimeout(r, 30000));
-
-  // Reintentos por si el audio tarda más
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const { buffer, mimetype } = await getAudioFromOdoo(uid, callIdWithRec);
-
-      // Determinar extensión según mimetype
-      const ext = mimetype.includes("ogg") ? "recording.ogg"
-                : mimetype.includes("mp3") || mimetype.includes("mpeg") ? "recording.mp3"
-                : "recording.wav";
-
-      // Transcribir con Whisper
-      const transcript = await transcribeAudioBuffer(buffer, ext, mimetype);
-      return transcript;
-    } catch (e) {
-      lastError = e;
-      console.warn(`[Odoo Audio] Intento ${attempt}/3 fallido: ${e.message}`);
-      if (attempt < 3) await new Promise(r => setTimeout(r, 15000));
-    }
-  }
-  throw lastError;
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  GEMINI — analizar llamada y decidir lead vs ticket
-// ════════════════════════════════════════════════════════════════════════════
-function buildSystemPrompt() {
-  return `
-Eres el analizador de llamadas de Piznalia / La Pizzerina / SmartChef24h.
-Devuelve SIEMPRE un único JSON válido, sin texto antes ni después.
-
-Formato:
-{
-  "tipo": "lead | ticket",
-  "categoria": "venta_maquina | venta_pizza | operador_vending | averia | consulta_tecnica | info_general | otros",
-  "interes": "Máquinas de pizzas y comida | Pizza sector Horeca | Ambos | Otros",
-  "sector": "Pizzería o restauración | Operador vending | Inversor | Particular | Otros",
-  "urgencia": "alta | media | baja",
-  "resumen": "frase breve de máximo 2 líneas",
-  "idioma": "es | ca | en | fr | pt"
-}
-
-Reglas:
-- tipo="ticket" SOLO si el cliente describe claramente una avería o fallo técnico en una máquina
-- tipo="lead" en cualquier otro caso (interés comercial, consulta general, información, etc.)
-- Si el cliente no habla de avería → tipo="lead" siempre
-- No inventes datos. Si no puedes determinar algo → pon el valor más genérico
-- RESPONDE SOLO CON JSON VÁLIDO
-`.trim();
-}
-
-async function callGemini(transcript, callerPhone, extensionInfo) {
-  if (!GEMINI_API_KEY) throw new Error("Falta GEMINI_API_KEY");
-
-  const userPrompt = `
-Llamada telefónica recibida.
-Teléfono: ${callerPhone || "desconocido"}
-Extensión atendida: ${extensionInfo || "desconocida"}
-
-TRANSCRIPCIÓN:
-${transcript}
-
-Devuelve el JSON de análisis.
-`.trim();
-
-  const modelId = encodeURIComponent(GEMINI_MODEL);
-  const url     = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent`;
-
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: buildSystemPrompt() + "\n\n---\n\n" + userPrompt }] }],
-    }),
-  });
-
-  if (!resp.ok) throw new Error(`Gemini HTTP ${resp.status}: ${await resp.text()}`);
-
-  const data    = await resp.json();
-  const rawText = (data?.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("") || "").trim();
-  if (!rawText) throw new Error("Gemini devolvió contenido vacío");
-
-  const tryParse = s => { try { return JSON.parse(s); } catch { return null; } };
-  let parsed = tryParse(rawText);
-  if (!parsed) {
-    const i = rawText.indexOf("{"), j = rawText.lastIndexOf("}");
-    if (i !== -1 && j > i) parsed = tryParse(rawText.slice(i, j + 1));
-  }
-  if (!parsed) throw new Error("No se pudo parsear JSON de Gemini: " + rawText.slice(0, 200));
-
-  return {
-    tipo:      String(parsed.tipo      || "lead").toLowerCase(),
-    categoria: String(parsed.categoria || "otros").toLowerCase(),
-    interes:   parsed.interes  || "Otros",
-    sector:    parsed.sector   || "Otros",
-    urgencia:  String(parsed.urgencia  || "media").toLowerCase(),
-    resumen:   parsed.resumen  || "",
-    idioma:    String(parsed.idioma    || "es").toLowerCase(),
-  };
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  ODOO — helpers
+//  ODOO — helpers JSON-RPC
 // ════════════════════════════════════════════════════════════════════════════
 async function odooRpc(payload) {
   if (!ODOO_BASE_URL || !ODOO_DB || !ODOO_USER_EMAIL || !ODOO_API_KEY)
     throw new Error("Faltan variables de Odoo");
-
   const resp = await fetch(`${ODOO_BASE_URL}/jsonrpc`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
   if (!resp.ok) throw new Error(`Odoo HTTP ${resp.status}`);
-
   const data = await resp.json();
   if (data?.error) {
     const msg = data.error?.data?.message || data.error?.message || JSON.stringify(data.error);
@@ -392,6 +96,7 @@ async function odooRpc(payload) {
   return data.result;
 }
 
+let cachedOdooUid = null;
 async function odooAuth() {
   if (cachedOdooUid) return cachedOdooUid;
   const uid = await odooRpc({
@@ -412,36 +117,231 @@ async function odooExec(uid, model, method, args = [], kwargs = {}, id = 2) {
   });
 }
 
-// Busca partner por teléfono (últimos 9 dígitos)
+// ════════════════════════════════════════════════════════════════════════════
+//  ODOO AUDIO — buscar y descargar audio subido por Zadarma
+//  Zadarma sube el audio como ir.attachment en res.partner
+//  Nombre: 539601-{call_id_with_rec}-{telefono}-{fecha}.ogg
+// ════════════════════════════════════════════════════════════════════════════
+async function getAudioFromOdoo(uid, callIdWithRec) {
+  console.log("[Odoo Audio] Buscando adjunto:", callIdWithRec);
+
+  const attachments = await odooExec(uid, "ir.attachment", "search_read",
+    [[["name", "ilike", callIdWithRec]]],
+    { fields: ["id", "name", "mimetype", "datas"], limit: 5 }, 90
+  );
+
+  if (!attachments || attachments.length === 0)
+    throw new Error(`Adjunto no encontrado para: ${callIdWithRec}`);
+
+  const att = attachments[0];
+  console.log(`[Odoo Audio] Encontrado: id=${att.id} | ${att.name} | ${att.mimetype}`);
+
+  let datas = att.datas;
+  if (!datas) {
+    const read = await odooExec(uid, "ir.attachment", "read",
+      [[att.id]], { fields: ["datas"] }, 91);
+    datas = read?.[0]?.datas;
+  }
+
+  if (!datas) throw new Error(`Sin contenido en adjunto id=${att.id}`);
+
+  const buffer = Buffer.from(datas, "base64");
+  const sizeMB = (buffer.byteLength / 1024 / 1024).toFixed(2);
+  console.log(`[Odoo Audio] Listo: ${sizeMB}MB | ${att.mimetype}`);
+  return { buffer, mimetype: att.mimetype || "audio/ogg" };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  IA — Prompt y parser
+// ════════════════════════════════════════════════════════════════════════════
+function buildSystemPrompt() {
+  return `
+Eres el analizador de llamadas de Piznalia / La Pizzerina / SmartChef24h.
+Devuelve SIEMPRE un único JSON válido, sin texto antes ni después, sin markdown.
+
+Formato exacto:
+{
+  "tipo": "lead | ticket",
+  "categoria": "venta_maquina | venta_pizza | operador_vending | averia | consulta_tecnica | info_general | otros",
+  "interes": "Máquinas de pizzas y comida | Pizza sector Horeca | Ambos | Otros",
+  "sector": "Pizzería o restauración | Operador vending | Inversor | Particular | Otros",
+  "urgencia": "alta | media | baja",
+  "resumen": "frase breve máximo 2 líneas",
+  "idioma": "es | ca | en | fr | pt"
+}
+
+Reglas:
+- tipo="ticket" SOLO si el cliente describe claramente una avería o fallo técnico en una máquina
+- tipo="lead" en cualquier otro caso
+- No inventes datos. Si no puedes determinar algo → valor más genérico
+- RESPONDE SOLO CON JSON VÁLIDO
+`.trim();
+}
+
+function parseGeminiJSON(rawText) {
+  const tryParse = s => { try { return JSON.parse(s); } catch { return null; } };
+  let parsed = tryParse(rawText);
+  if (!parsed) {
+    const i = rawText.indexOf("{"), j = rawText.lastIndexOf("}");
+    if (i !== -1 && j > i) parsed = tryParse(rawText.slice(i, j + 1));
+  }
+  if (!parsed) throw new Error("JSON no parseable: " + rawText.slice(0, 200));
+  return {
+    tipo:      String(parsed.tipo      || "lead").toLowerCase(),
+    categoria: String(parsed.categoria || "otros").toLowerCase(),
+    interes:   parsed.interes  || "Otros",
+    sector:    parsed.sector   || "Otros",
+    urgencia:  String(parsed.urgencia  || "media").toLowerCase(),
+    resumen:   parsed.resumen  || "",
+    idioma:    String(parsed.idioma    || "es").toLowerCase(),
+  };
+}
+
+async function geminiRequest(parts) {
+  const model = "gemini-2.0-flash";
+  const url   = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const t0    = Date.now();
+  const resp  = await fetch(url, {
+    method: "POST",
+    headers: { "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({ contents: [{ role: "user", parts }] }),
+  });
+  console.log(`[Gemini] HTTP ${resp.status} en ${((Date.now()-t0)/1000).toFixed(1)}s`);
+  if (!resp.ok) throw new Error(`Gemini HTTP ${resp.status}: ${(await resp.text()).slice(0,300)}`);
+  const data    = await resp.json();
+  const rawText = (data?.candidates?.[0]?.content?.parts?.map(p => p.text||"").join("")||"").trim();
+  if (!rawText) throw new Error("Gemini devolvió contenido vacío");
+  return rawText;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  GEMINI AUDIO — transcribe + clasifica en una sola llamada (gratis)
+// ════════════════════════════════════════════════════════════════════════════
+async function analyzeAudioWithGemini(buffer, mimetype, callerPhone, extensionInfo) {
+  const audioBase64  = Buffer.from(buffer).toString("base64");
+  const audioSizeMB  = (buffer.byteLength / 1024 / 1024).toFixed(2);
+  const base64SizeMB = (audioBase64.length / 1024 / 1024).toFixed(2);
+  console.log(`[Gemini Audio] ${audioSizeMB}MB audio | ${base64SizeMB}MB base64`);
+
+  // Límite de seguridad: 15MB base64 (límite real Gemini inline: 20MB)
+  if (audioBase64.length > 15 * 1024 * 1024)
+    throw new Error(`Audio demasiado grande (${base64SizeMB}MB > 15MB) → fallback Whisper`);
+
+  const prompt = buildSystemPrompt() +
+    `\n\n---\nEscucha esta llamada de Piznalia/SmartChef24h.\n` +
+    `Teléfono: ${callerPhone||"?"} | Extensión: ${extensionInfo||"?"}\n` +
+    `Transcribe el audio y devuelve el JSON de análisis.`;
+
+  const rawText = await geminiRequest([
+    { inline_data: { mime_type: mimetype || "audio/ogg", data: audioBase64 } },
+    { text: prompt },
+  ]);
+  console.log("[Gemini Audio] Raw:", rawText.slice(0, 200));
+  return parseGeminiJSON(rawText);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WHISPER — fallback si Gemini no puede con el audio
+// ════════════════════════════════════════════════════════════════════════════
+async function transcribeWithWhisper(buffer, mimetype) {
+  if (!OPENAI_API_KEY) throw new Error("Falta OPENAI_API_KEY para fallback Whisper");
+  console.log("[Whisper] Transcribiendo como fallback...");
+  const ext      = (mimetype || "").includes("ogg") ? "recording.ogg" : "recording.mp3";
+  const formData = new FormData();
+  formData.append("file", new Blob([buffer], { type: mimetype || "audio/ogg" }), ext);
+  formData.append("model", "whisper-1");
+  formData.append("language", "es");
+  formData.append("response_format", "text");
+  const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST", headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, body: formData,
+  });
+  if (!resp.ok) throw new Error(`Whisper HTTP ${resp.status}: ${await resp.text()}`);
+  const text = (await resp.text()).trim();
+  console.log(`[Whisper] OK: ${text.length} chars`);
+  return text;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  GEMINI TEXTO — analizar transcripción ya hecha
+// ════════════════════════════════════════════════════════════════════════════
+async function analyzeTextWithGemini(transcript, callerPhone, extensionInfo) {
+  const prompt = buildSystemPrompt() +
+    `\n\n---\nLlamada de Piznalia/SmartChef24h.\n` +
+    `Teléfono: ${callerPhone||"?"} | Extensión: ${extensionInfo||"?"}\n\n` +
+    `TRANSCRIPCIÓN:\n${transcript}\n\nDevuelve el JSON.`;
+  const rawText = await geminiRequest([{ text: prompt }]);
+  return parseGeminiJSON(rawText);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  FLUJO COMPLETO DE ANÁLISIS
+//  1º Gemini audio directo (gratis)
+//  2º si falla → Whisper + Gemini texto (fallback, ~2€/mes)
+// ════════════════════════════════════════════════════════════════════════════
+async function analyzeCallFromOdoo(uid, callIdWithRec, callerPhone, extensionInfo) {
+  console.log("[Audio] Esperando 60s para que Zadarma suba el audio a Odoo...");
+  await new Promise(r => setTimeout(r, 60000));
+
+  let lastError;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const { buffer, mimetype } = await getAudioFromOdoo(uid, callIdWithRec);
+
+      // Intentar Gemini con audio directo
+      try {
+        const ai = await analyzeAudioWithGemini(buffer, mimetype, callerPhone, extensionInfo);
+        console.log(`[IA] Gemini audio OK: tipo=${ai.tipo} | ${ai.resumen}`);
+        return ai;
+      } catch (geminiErr) {
+        console.warn(`[Gemini Audio] Falló: ${geminiErr.message}`);
+      }
+
+      // Fallback Whisper → Gemini texto
+      if (OPENAI_API_KEY) {
+        console.log("[Audio] Intentando fallback Whisper...");
+        const transcript = await transcribeWithWhisper(buffer, mimetype);
+        const ai = await analyzeTextWithGemini(transcript, callerPhone, extensionInfo);
+        console.log(`[IA] Whisper+Gemini OK: tipo=${ai.tipo} | ${ai.resumen}`);
+        return ai;
+      }
+
+      throw new Error("Gemini audio falló y no hay OPENAI_API_KEY para fallback");
+
+    } catch (e) {
+      lastError = e;
+      console.warn(`[Audio] Intento ${attempt}/4: ${e.message}`);
+      if (attempt < 4) {
+        const wait = attempt * 20000;
+        console.log(`[Audio] Esperando ${wait/1000}s...`);
+        await new Promise(r => setTimeout(r, wait));
+      }
+    }
+  }
+  throw lastError;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ODOO CRM — contactos, máquinas, leads, tickets, notas
+// ════════════════════════════════════════════════════════════════════════════
 async function findOrCreatePartner(uid, { name, phone, email }) {
   const digits = String(phone || "").replace(/\D/g, "").slice(-9);
-  let partnerId = null;
-
   if (digits) {
     const ids = await odooExec(uid, "res.partner", "search",
       [[["phone", "ilike", digits]]], { limit: 1 }, 10);
-    partnerId = ids?.[0] || null;
+    if (ids?.[0]) {
+      console.log(`[Odoo] Contacto existente: #${ids[0]}`);
+      return { partnerId: ids[0], isNew: false };
+    }
   }
-
-  if (!partnerId) {
-    // Nombre real del contacto:
-    // Zadarma raramente manda el nombre — usamos el teléfono como provisional
-    const partnerName = (name && name.trim().length > 2 && name.toLowerCase() !== "llamada")
-      ? name.trim()
-      : (phone ? `Tel. ${phone}` : "Contacto sin nombre");
-
-    partnerId = await odooExec(uid, "res.partner", "create", [[{
-      name:  partnerName,
-      phone: phone || undefined,
-      email: email || undefined,
-    }]], {}, 11);
-    console.log(`[Odoo] Contacto nuevo creado: #${partnerId} — ${partnerName}`);
-  }
-
-  return partnerId;
+  const partnerName = (name && name.trim().length > 2 && name.toLowerCase() !== "llamada")
+    ? name.trim() : (phone ? `Tel. ${phone}` : "Contacto sin nombre");
+  const newId = await odooExec(uid, "res.partner", "create", [[{
+    name: partnerName, phone: phone || undefined, email: email || undefined,
+  }]], {}, 11);
+  console.log(`[Odoo] Contacto nuevo: #${newId} — ${partnerName}`);
+  return { partnerId: newId, isNew: true };
 }
 
-// Busca máquinas asociadas al partner
 async function findMachinesByPartner(uid, partnerId) {
   try {
     const recs = await odooExec(uid, "x_maquina_operador", "search_read",
@@ -449,65 +349,60 @@ async function findMachinesByPartner(uid, partnerId) {
       { fields: ["id", "x_name", "x_studio_x_machine_uid", "x_estado", "x_ubicacion"], limit: 10 }, 20);
     return Array.isArray(recs) ? recs : [];
   } catch (e) {
-    console.warn("[machines] No se pudo leer x_maquina_operador:", e.message);
+    console.warn("[machines] Error:", e.message);
     return [];
   }
 }
 
+let cachedHelpdeskTeamId = null;
 async function getHelpdeskTeamId(uid) {
   if (cachedHelpdeskTeamId) return cachedHelpdeskTeamId;
   const teams = await odooExec(uid, "helpdesk.team", "search_read",
-    [[["name", "ilike", ODOO_HELPDESK_TEAM_NAME]]], { fields: ["id", "name"], limit: 1 }, 12);
+    [[["name", "ilike", ODOO_HELPDESK_TEAM_NAME]]], { fields: ["id"], limit: 1 }, 12);
   cachedHelpdeskTeamId = teams?.[0]?.id || null;
   return cachedHelpdeskTeamId;
 }
 
-function urgencyToPriority(urg) {
-  if (urg === "alta")  return "3";
-  if (urg === "media") return "2";
-  return "1";
+function urgencyToPriority(u) {
+  if (u === "alta") return "3"; if (u === "media") return "2"; return "1";
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  HELPERS — asunto normalizado para leads y tickets
-// ════════════════════════════════════════════════════════════════════════════
 
 function buildLeadName(ai, callerName, callerPhone) {
   const quien = callerName || callerPhone || "Desconocido";
-  const temaMap = {
-    venta_maquina:    "Comercial - Maquina pizza",
-    venta_pizza:      "Comercial - Pizzas",
-    operador_vending: "Comercial - Operador vending",
-    averia:           "SAT - Averia",
-    consulta_tecnica: "SAT - Consulta tecnica",
-    info_general:     "Info general",
-    otros:            "Otros",
+  const temas = {
+    venta_maquina: "Comercial - Maquina pizza", venta_pizza: "Comercial - Pizzas",
+    operador_vending: "Comercial - Operador vending", averia: "SAT - Averia",
+    consulta_tecnica: "SAT - Consulta tecnica", info_general: "Info general", otros: "Otros",
   };
-  const tema = temaMap[ai.categoria] || "Otros";
-  return `LLAMADA | ${quien} | ${tema}`;
+  return `LLAMADA | ${quien} | ${temas[ai.categoria] || "Otros"}`;
 }
 
 function buildTicketName(ai, callerName, callerPhone) {
-  const quien = callerName || callerPhone || "Desconocido";
-  const resumen = ai.resumen ? ai.resumen.slice(0, 60) : "Incidencia";
-  return `[SAT LLAMADA] ${quien} - ${resumen}`;
+  return `[SAT LLAMADA] ${callerName||callerPhone||"Desconocido"} - ${(ai.resumen||"Incidencia").slice(0,60)}`;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  CREAR LEAD en crm.lead
-//  Campos reales confirmados del PDF:
-//    name, phone, email_from, partner_id, contact_name, description,
-//    priority, type, tag_ids, partner_name, city,
-//    x_Interes, x_Sector, x_resumen_ia, x_respuesta_ia, x_estado_ia
-// ════════════════════════════════════════════════════════════════════════════
-async function createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId, transcript) {
-  const citaUrl = ODOO_APPOINTMENT_URL;
+async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId) {
+  const body = [
+    `<b>📞 Llamada recibida</b>`,
+    `<b>Tel:</b> ${callerPhone||"?"} | <b>Ext:</b> ${extensionInfo||"?"}`,
+    callId ? `<b>Call ID:</b> ${callId}` : "",
+    `<b>Resumen:</b> ${ai.resumen||""}`,
+    `<b>Categoría:</b> ${ai.categoria} | <b>Urgencia:</b> ${ai.urgencia}`,
+  ].filter(Boolean).join("<br/>");
+  try {
+    await odooExec(uid, "res.partner", "message_post", [[partnerId]], {
+      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
+    }, 55);
+    console.log(`[Odoo] Nota en contacto #${partnerId}`);
+  } catch (e) { console.warn("[Odoo] Nota fallida:", e.message); }
+}
 
-  // Respuesta sugerida para mandar al cliente
+async function createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId) {
+  const citaUrl = ODOO_APPOINTMENT_URL;
   let respuesta = `Hola${callerName ? " " + callerName : ""},\n\nGracias por contactar con Piznalia / La Pizzerina.\n\n`;
-  if (["venta_maquina", "operador_vending"].includes(ai.categoria)) {
-    respuesta += "Hemos recibido tu consulta sobre nuestras máquinas SmartChef24h. Te enviaremos información adaptada a tu caso.\n";
-    if (citaUrl) respuesta += `\nSi prefieres, agenda una llamada aquí: ${citaUrl}\n`;
+  if (["venta_maquina","operador_vending"].includes(ai.categoria)) {
+    respuesta += "Hemos recibido tu consulta sobre nuestras máquinas SmartChef24h. Te enviaremos información adaptada.\n";
+    if (citaUrl) respuesta += `\nAgenda una llamada: ${citaUrl}\n`;
   } else if (ai.categoria === "venta_pizza") {
     respuesta += "Hemos recibido tu interés por nuestras pizzas. Te enviaremos catálogo y condiciones.\n";
   } else {
@@ -517,288 +412,203 @@ async function createLead(uid, ai, callerPhone, callerName, partnerId, extension
 
   const description = [
     `📞 Llamada recibida`,
-    `Teléfono: ${callerPhone || "desconocido"}`,
-    `Extensión: ${extensionInfo || "desconocida"}`,
+    `Teléfono: ${callerPhone||"?"}`,
+    `Extensión: ${extensionInfo||"?"}`,
     callId ? `Call ID: ${callId}` : "",
     ``,
     `🤖 RESUMEN IA:`,
     ai.resumen || "",
     ``,
-    `Categoría: ${ai.categoria}`,
-    `Urgencia: ${ai.urgencia}`,
-    `Idioma detectado: ${ai.idioma}`,
-  ].filter(l => l !== null).join("\n").trim();
+    `Categoría: ${ai.categoria} | Urgencia: ${ai.urgencia} | Idioma: ${ai.idioma}`,
+  ].filter(Boolean).join("\n").trim();
 
   const vals = {
-    name:          buildLeadName(ai, callerName, callerPhone),
-    type:          "lead",
-    phone:         callerPhone || undefined,
-    contact_name:  callerName  || undefined,
-    partner_id:    partnerId   || undefined,
+    name:           buildLeadName(ai, callerName, callerPhone),
+    type:           "lead",
+    phone:          callerPhone || undefined,
+    contact_name:   callerName  || undefined,
+    partner_id:     partnerId   || undefined,
     description,
-    priority:      urgencyToPriority(ai.urgencia),
-    x_Interes:     ai.interes  || "Otros",
-    x_Sector:      ai.sector   || "Otros",
-    x_resumen_ia:  ai.resumen  || "",
+    priority:       urgencyToPriority(ai.urgencia),
+    x_Interes:      ai.interes  || "Otros",
+    x_Sector:       ai.sector   || "Otros",
+    x_resumen_ia:   ai.resumen  || "",
     x_respuesta_ia: respuesta,
-    x_estado_ia:   "procesado",
+    x_estado_ia:    "procesado",
   };
-
   const leadId = await odooExec(uid, "crm.lead", "create", [[vals]], {}, 50);
-  console.log(`[Odoo] Lead creado: #${leadId}`);
+  console.log(`[Odoo] Lead #${leadId}: ${vals.name}`);
   return leadId;
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  CREAR TICKET en helpdesk.ticket
-//  Campos reales confirmados del PDF:
-//    name, partner_id, partner_phone, description, priority,
-//    team_id, user_id, x_studio_x_maquina_id (campo personalizado máquina)
-// ════════════════════════════════════════════════════════════════════════════
-async function createTicket(uid, ai, callerPhone, callerName, partnerId, machines, extensionInfo, callId, transcript) {
-  const teamId = await getHelpdeskTeamId(uid);
-
-  // Si hay una sola máquina, la asignamos directamente
+async function createTicket(uid, ai, callerPhone, callerName, partnerId, machines, extensionInfo, callId) {
+  const teamId        = await getHelpdeskTeamId(uid);
   const machineUnique = machines.length === 1 ? machines[0] : null;
-
-  const machinesTxt = machines.length
-    ? machines.map(m => `- ${m.x_name || "Sin nombre"} (ID: ${m.x_studio_x_machine_uid || m.id}, Estado: ${m.x_estado || "?"}, Ubicación: ${m.x_ubicacion || "?"})`).join("\n")
-    : "- No se encontraron máquinas asociadas al contacto";
+  const machinesTxt   = machines.length
+    ? machines.map(m => `- ${m.x_name||"?"} (ID: ${m.x_studio_x_machine_uid||m.id}, Estado: ${m.x_estado||"?"}, Ub: ${m.x_ubicacion||"?"})`).join("\n")
+    : "- Sin máquinas registradas";
 
   const description = [
-    `📞 Llamada SAT recibida`,
-    `Teléfono: ${callerPhone || "desconocido"}`,
-    `Extensión: ${extensionInfo || "desconocida"}`,
+    `📞 Llamada SAT`, `Tel: ${callerPhone||"?"}`, `Ext: ${extensionInfo||"?"}`,
     callId ? `Call ID: ${callId}` : "",
-    ``,
-    `🤖 RESUMEN IA:`,
-    ai.resumen || "",
-    ``,
-    `Categoría: ${ai.categoria}`,
-    `Urgencia: ${ai.urgencia}`,
-    ``,
-    `🔧 MÁQUINAS DEL CLIENTE:`,
-    machinesTxt,
+    ``, `🤖 RESUMEN IA:`, ai.resumen||"",
+    ``, `Categoría: ${ai.categoria} | Urgencia: ${ai.urgencia}`,
+    ``, `🔧 MÁQUINAS:`, machinesTxt,
   ].join("\n").trim();
 
   const vals = {
     name:          buildTicketName(ai, callerName, callerPhone),
-    partner_id:    partnerId || undefined,
+    partner_id:    partnerId   || undefined,
     partner_phone: callerPhone || undefined,
     partner_name:  callerName  || undefined,
     description,
     priority:      urgencyToPriority(ai.urgencia),
-    team_id:       teamId || undefined,
+    team_id:       teamId      || undefined,
     user_id:       uid,
   };
-
-  // Campo personalizado máquina (nombre real del PDF: x_studio_x_maquina_id)
-  if (machineUnique) {
-    vals.x_studio_x_maquina_id = machineUnique.id;
-  }
+  if (machineUnique) vals.x_studio_x_maquina_id = machineUnique.id;
 
   const ticketId = await odooExec(uid, "helpdesk.ticket", "create", [[vals]], {}, 60);
-  console.log(`[Odoo] Ticket creado: #${ticketId}${machineUnique ? ` (máquina: ${machineUnique.x_name})` : ""}`);
+  console.log(`[Odoo] Ticket #${ticketId}${machineUnique ? ` — ${machineUnique.x_name}` : ""}`);
   return ticketId;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 //  LÓGICA PRINCIPAL — decide qué crear en Odoo
 // ════════════════════════════════════════════════════════════════════════════
-async function processCall({ transcript, callerPhone, callerName, extensionInfo, callId }) {
+async function processCallWithAI({ ai, callerPhone, callerName, extensionInfo, callId }) {
   const uid = await odooAuth();
+  console.log(`[IA] tipo=${ai.tipo} | cat=${ai.categoria} | urg=${ai.urgencia} | ${ai.resumen}`);
 
-  // 1. Analizar con Gemini
-  const ai = await callGemini(transcript, callerPhone, extensionInfo);
-  console.log(`[IA] tipo=${ai.tipo} categoria=${ai.categoria} urgencia=${ai.urgencia}`);
-  console.log(`[IA] resumen: ${ai.resumen}`);
-
-  // 2. Buscar/crear contacto
   const { partnerId, isNew } = await findOrCreatePartner(uid, {
-    name:  callerName,
-    phone: callerPhone,
-    email: null,
+    name: callerName, phone: callerPhone, email: null,
   });
 
-  // 3. Si la IA dice "ticket", verificar si tiene máquinas
   if (ai.tipo === "ticket") {
     const machines = partnerId ? await findMachinesByPartner(uid, partnerId) : [];
-
     if (machines.length > 0) {
-      // Tiene máquinas → crear ticket SAT + nota en contacto
-      const ticketId = await createTicket(uid, ai, callerPhone, callerName, partnerId, machines, extensionInfo, callId, transcript);
+      const ticketId = await createTicket(uid, ai, callerPhone, callerName, partnerId, machines, extensionInfo, callId);
       await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
       return { created: "ticket", id: ticketId, ai };
-    } else {
-      // IA dice ticket pero sin máquina → lead + nota si contacto existente
-      console.log("[Lógica] IA detectó avería pero cliente sin máquina → Lead");
-      ai.resumen = `[Sin máquina registrada] ${ai.resumen}`.trim();
-      if (!isNew) {
-        await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
-      }
-      const leadId = await createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId, transcript);
-      return { created: "lead", id: leadId, ai, note: "sin_maquina" };
     }
+    console.log("[Lógica] Avería sin máquina → Lead");
+    ai.resumen = `[Sin máquina registrada] ${ai.resumen}`.trim();
+    if (!isNew) await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
+    const leadId = await createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId);
+    return { created: "lead", id: leadId, ai, note: "sin_maquina" };
   }
 
-  // 4. Contacto existente → solo nota en contacto, sin lead nuevo
   if (!isNew && partnerId) {
     await postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId);
-    console.log(`[Lógica] Contacto existente → nota añadida, sin lead nuevo`);
     return { created: "note", id: partnerId, ai };
   }
 
-  // 5. Contacto nuevo → crear lead
-  const leadId = await createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId, transcript);
+  const leadId = await createLead(uid, ai, callerPhone, callerName, partnerId, extensionInfo, callId);
   return { created: "lead", id: leadId, ai };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  WEBHOOK ZADARMA — GET (verificación zd_echo)
+//  WEBHOOK ZADARMA
 // ════════════════════════════════════════════════════════════════════════════
 app.get("/webhooks/zadarma/notify_record", (req, res) => {
   const echo = req.query.zd_echo;
   if (echo !== undefined) {
-    console.log("[Zadarma] Verificación zd_echo:", echo);
+    console.log("[Zadarma] zd_echo:", echo);
     res.setHeader("Content-Type", "text/plain");
     return res.send(String(echo));
   }
-  return res.json({ ok: true, service: SERVICE_NAME, version: VERSION,
-                    message: "Webhook Zadarma activo." });
+  return res.json({ ok: true, service: SERVICE_NAME, version: VERSION });
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  WEBHOOK ZADARMA — POST (eventos)
-// ════════════════════════════════════════════════════════════════════════════
 app.post("/webhooks/zadarma/notify_record", async (req, res) => {
   const body = req.body || {};
 
-  // Verificación zd_echo por POST (por si acaso)
   if (req.query.zd_echo !== undefined) {
     res.setHeader("Content-Type", "text/plain");
     return res.send(String(req.query.zd_echo));
   }
 
-  const event = String(body.event || "").toUpperCase();
-  console.log(`[Zadarma] Evento: ${event} | pbx_call_id: ${body.pbx_call_id || "?"}`);
+  const event     = String(body.event || "").toUpperCase();
+  const pbxCallId = body.pbx_call_id || null;
+  console.log(`[Zadarma] ${event} | pbx: ${pbxCallId || "?"}`);
 
-  // ── NOTIFY_END: guardar extensión en cache ─────────────────────────────
   if (event === "NOTIFY_END") {
-    const pbxCallId = body.pbx_call_id;
     if (pbxCallId) {
       cacheSet(pbxCallId, {
-        internal:   body.internal    || body.last_internal || null,
-        caller_id:  body.caller_id   || null,
+        internal:    body.internal    || body.last_internal || null,
+        caller_id:   body.caller_id   || null,
         caller_name: body.caller_name || null,
       });
-      console.log(`[Cache] NOTIFY_END guardado: pbx_call_id=${pbxCallId} internal=${body.internal || "?"}`);
+      console.log(`[Cache] Guardado: pbx=${pbxCallId} ext=${body.internal||"?"}`);
     }
-    return res.json({ ok: true, event: "NOTIFY_END", cached: !!pbxCallId });
+    return res.json({ ok: true, event: "NOTIFY_END" });
   }
 
-  // ── Ignorar eventos que no son NOTIFY_RECORD ───────────────────────────
-  if (event !== "NOTIFY_RECORD") {
+  if (event !== "NOTIFY_RECORD")
     return res.json({ ok: true, skipped: true, event });
-  }
 
-  // ── NOTIFY_RECORD: procesar grabación ─────────────────────────────────
   const callIdWithRec = body.call_id_with_rec || body.call_id || null;
-  const pbxCallId     = body.pbx_call_id || null;
-
-  if (!callIdWithRec) {
-    console.warn("[Zadarma] NOTIFY_RECORD sin call_id_with_rec");
+  if (!callIdWithRec)
     return res.status(400).json({ ok: false, error: "missing_call_id_with_rec" });
-  }
 
-  // Responder inmediatamente a Zadarma
   res.json({ ok: true, service: SERVICE_NAME, received: callIdWithRec });
 
-  // Recuperar datos de NOTIFY_END del cache
   const cached      = pbxCallId ? cacheGet(pbxCallId) : null;
   const callerPhone = body.caller_id   || cached?.caller_id   || null;
   const callerName  = body.caller_name || cached?.caller_name || null;
   const internal    = body.internal    || cached?.internal    || null;
-  const extensionInfo = internal ? `ext. ${internal}` : "desconocida";
+  const extInfo     = internal ? `ext. ${internal}` : "desconocida";
 
-  // Procesamiento asíncrono
   setImmediate(async () => {
     try {
-      // Zadarma sube el audio a Odoo automáticamente como ir.attachment
-      // Buscamos el audio directamente en Odoo sin necesidad de la API de Zadarma
-      const uid = await odooAuth();
-      const transcript = await transcribeFromOdoo(uid, callIdWithRec);
-      if (!transcript || transcript.trim().length < 5) {
-        console.warn("[Whisper] Transcripción vacía, descartando.");
-        return;
-      }
-
-      // 3. Procesar y crear en Odoo
-      const result = await processCall({
-        transcript, callerPhone, callerName, extensionInfo,
-        callId: callIdWithRec,
-      });
-
-      console.log(`[OK] Creado: ${result.created} #${result.id} | ${result.ai.resumen}`);
-      if (result.note) console.log(`[Nota] ${result.note}`);
-
+      const uid    = await odooAuth();
+      const ai     = await analyzeCallFromOdoo(uid, callIdWithRec, callerPhone, extInfo);
+      const result = await processCallWithAI({ ai, callerPhone, callerName, extensionInfo: extInfo, callId: callIdWithRec });
+      console.log(`[OK] ${result.created} #${result.id} | ${result.ai.resumen}`);
     } catch (err) {
-      console.error("[ERROR] Procesamiento llamada:", err.message);
-      // Fallback: crear lead básico para no perder la llamada
+      console.error("[ERROR]", err.message);
       try {
-        const uid = await odooAuth();
-        const partnerResult = callerPhone
-          ? await findOrCreatePartner(uid, { name: callerName, phone: callerPhone, email: null })
-          : null;
-        const partnerId = partnerResult?.partnerId || null;
+        const uid        = await odooAuth();
+        const partnerRes = callerPhone ? await findOrCreatePartner(uid, { name: callerName, phone: callerPhone, email: null }) : null;
         const aiFallback = {
           tipo: "lead", categoria: "otros", interes: "Otros", sector: "Otros",
-          urgencia: "media", resumen: `Llamada no procesada (error: ${err.message.slice(0, 80)})`,
-          idioma: "es",
+          urgencia: "media", idioma: "es",
+          resumen: `Llamada no procesada (error: ${err.message.slice(0, 80)})`,
         };
-        const leadId = await createLead(uid, aiFallback, callerPhone, callerName, partnerId, extensionInfo, callIdWithRec, null);
-        console.log(`[Fallback] Lead básico creado: #${leadId}`);
-      } catch (e2) {
-        console.error("[Fallback] También falló:", e2.message);
-      }
+        const leadId = await createLead(uid, aiFallback, callerPhone, callerName, partnerRes?.partnerId || null, extInfo, callIdWithRec);
+        console.log(`[Fallback] Lead #${leadId}`);
+      } catch (e2) { console.error("[Fallback] Falló:", e2.message); }
     }
   });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ENDPOINT MANUAL — analizar texto sin crear en Odoo
+//  ENDPOINTS MANUALES
 // ════════════════════════════════════════════════════════════════════════════
 app.post("/lead/analyze", async (req, res) => {
-  const body = req.body || {};
-  const text = body.text || body.mensaje || body.message || "";
+  const text = req.body?.text || req.body?.mensaje || req.body?.message || "";
   if (!text.trim()) return res.status(400).json({ ok: false, error: "missing_text" });
-
   try {
-    const ai = await callGemini(text, body.phone || "", body.extension || "");
+    const ai = await analyzeTextWithGemini(text, req.body?.phone || "", req.body?.extension || "");
     return res.json({ ok: true, service: SERVICE_NAME, ai });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
-  }
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
-// ════════════════════════════════════════════════════════════════════════════
-//  ENDPOINT MANUAL — analizar texto Y crear en Odoo
-// ════════════════════════════════════════════════════════════════════════════
 app.post("/lead/analyze-and-create", async (req, res) => {
   const body = req.body || {};
   const text = body.text || body.mensaje || body.message || "";
   if (!text.trim()) return res.status(400).json({ ok: false, error: "missing_text" });
-
   try {
-    const result = await processCall({
-      transcript:    text,
+    const ai     = await analyzeTextWithGemini(text, body.phone || "", body.extension || "");
+    const result = await processCallWithAI({
+      ai,
       callerPhone:   body.phone   || body.caller_id || null,
       callerName:    body.name    || body.nombre    || null,
       extensionInfo: body.extension || "manual",
-      callId:        body.call_id || null,
+      callId:        body.call_id   || null,
     });
     return res.json({ ok: true, service: SERVICE_NAME, ...result });
   } catch (err) {
-    console.error("[/lead/analyze-and-create]", err.message);
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
@@ -806,10 +616,8 @@ app.post("/lead/analyze-and-create", async (req, res) => {
 // ── ARRANQUE ─────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`[${SERVICE_NAME}] ${VERSION} escuchando en puerto ${PORT}`);
-  console.log(`  Odoo:    ${ODOO_BASE_URL || "⚠ NO CONFIGURADO"}`);
-  console.log(`  Gemini:  ${GEMINI_API_KEY ? "✓" : "⚠ NO CONFIGURADO"}`);
-  console.log(`  Whisper: ${OPENAI_API_KEY ? "✓" : "⚠ NO CONFIGURADO"}`);
-  console.log(`  Zadarma key:    [${ZADARMA_API_KEY}] len=${ZADARMA_API_KEY.length}`);
-  console.log(`  Zadarma secret: [${ZADARMA_API_SECRET}] len=${ZADARMA_API_SECRET.length}`);
+  console.log(`[${SERVICE_NAME}] ${VERSION} puerto ${PORT}`);
+  console.log(`  Odoo:    ${ODOO_BASE_URL || "⚠ NO CONFIG"}`);
+  console.log(`  Gemini:  ${GEMINI_API_KEY ? "✓ activo (principal)" : "⚠ NO CONFIG"}`);
+  console.log(`  Whisper: ${OPENAI_API_KEY ? "✓ disponible (fallback)" : "— no configurado (opcional)"}`);
 });
