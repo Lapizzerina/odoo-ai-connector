@@ -19,7 +19,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.1.1";
+const VERSION      = "v3.1.2";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL          = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -133,9 +133,11 @@ async function transcribeAudioUrl(audioUrl) {
 function zadarmaSign(method, params, secret) {
   // Implementación EXACTA del PHP oficial de Zadarma (Client.php):
   // $paramsString = http_build_query($params);  ← SIN ordenar
-  // $sign = base64_encode(hash_hmac('sha1', $method.$paramsString.md5($paramsString), $secret));
+  // PHP_QUERY_RFC1738: no codifica letras, números, _ - . ~
+  // encodeURIComponent codifica el punto (.) → hay que revertirlo
+  const phpEncode = s => encodeURIComponent(String(s)).replace(/%2E/gi, ".");
   const paramsStr = Object.keys(params)
-    .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(String(params[k]))}`)
+    .map(k => `${phpEncode(k)}=${phpEncode(params[k])}`)
     .join("&");
   const md5str  = crypto.createHash("md5").update(paramsStr).digest("hex");
   const toSign  = method + paramsStr + md5str;
@@ -304,11 +306,18 @@ async function findOrCreatePartner(uid, { name, phone, email }) {
   }
 
   if (!partnerId) {
+    // Nombre real del contacto:
+    // Zadarma raramente manda el nombre — usamos el teléfono como provisional
+    const partnerName = (name && name.trim().length > 2 && name.toLowerCase() !== "llamada")
+      ? name.trim()
+      : (phone ? `Tel. ${phone}` : "Contacto sin nombre");
+
     partnerId = await odooExec(uid, "res.partner", "create", [[{
-      name:  name  || (phone ? `Contacto ${phone}` : "Contacto sin nombre"),
+      name:  partnerName,
       phone: phone || undefined,
       email: email || undefined,
     }]], {}, 11);
+    console.log(`[Odoo] Contacto nuevo creado: #${partnerId} — ${partnerName}`);
   }
 
   return partnerId;
