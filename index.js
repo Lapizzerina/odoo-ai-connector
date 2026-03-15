@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.5.6";
+const VERSION      = "v3.5.7";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -608,9 +608,8 @@ ${contactoLines ? `<p><strong>👤 Datos:</strong><br/>${contactoLines}</p>` : "
   try {
     await odooExec(uid, "res.partner", "message_post", [[partnerId]], {
       body:            body,
-      message_type:    "comment",
-      subtype_xmlid:   "mail.mt_note",
-      content_subtype: "html",
+      message_type:  "comment",
+      subtype_xmlid: "mail.mt_note",
     }, 55);
     console.log(`[Odoo] Nota en contacto #${partnerId}`);
   } catch (e) { console.warn("[Odoo] Nota fallida:", e.message); }
@@ -910,7 +909,7 @@ app.post("/test/nota", async (req, res) => {
 <p><strong>Categoría:</strong> Venta máquina &nbsp; <strong>Urgencia:</strong> 🟡 Media</p>
 `.trim();
     await odooExec(uid, "res.partner", "message_post", [[parseInt(partner_id)]], {
-      body, message_type: "comment", subtype_xmlid: "mail.mt_note", content_subtype: "html",
+      body, message_type: "comment", subtype_xmlid: "mail.mt_note",
     }, 55);
     return res.json({ ok: true, message: `Nota enviada al contacto #${partner_id}` });
   } catch (e) {
