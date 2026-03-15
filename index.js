@@ -1,6 +1,6 @@
 // index.js — odoo-ai-connector + Gemini + Whisper + Odoo + Zadarma
 // Node 18+ (Render) — usa fetch nativo
-// v2.0.0 — Añade transcripción automática con Whisper (OpenAI) desde grabaciones Zadarma
+// v2.1.0 — Fix verificación zd_echo de Zadarma (GET query string)
 
 const express = require("express");
 const crypto = require("crypto");
@@ -8,7 +8,7 @@ const crypto = require("crypto");
 const app = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION = "v2.0.0";
+const VERSION = "v2.1.0";
 
 // ========= CONFIG ODOO =========
 const ODOO_BASE_URL = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -1052,7 +1052,7 @@ app.post("/lead/analyze-and-create", async (req, res) => {
 });
 
 /* =====================================================================
- *  WEBHOOK ZADARMA — NOTIFY_RECORD (NUEVO ✨)
+ *  WEBHOOK ZADARMA — NOTIFY_RECORD
  *
  *  Zadarma llama a este endpoint cuando la grabación está lista.
  *  Pasos:
@@ -1063,21 +1063,41 @@ app.post("/lead/analyze-and-create", async (req, res) => {
  *   5. Crea lead o ticket en Odoo según la intención detectada
  *
  *  Configura en Zadarma:
- *    Panel → PBX → Notificaciones → URL del webhook → POST
+ *    Settings → Integrations and API → Notifications → About PBX calls
  *    URL: https://odoo-ai-connector.onrender.com/webhooks/zadarma/notify_record
+ *
+ *  IMPORTANTE — verificación zd_echo:
+ *    Zadarma hace GET ?zd_echo=VALOR para verificar el servidor.
+ *    El handler GET responde con el valor en texto plano.
  * ===================================================================== */
 
+// GET — verificación zd_echo de Zadarma (OBLIGATORIO para que acepte la URL)
+app.get("/webhooks/zadarma/notify_record", (req, res) => {
+  const echo = req.query.zd_echo;
+  if (echo !== undefined) {
+    console.log("[Zadarma] Verificación zd_echo:", echo);
+    res.setHeader("Content-Type", "text/plain");
+    return res.send(String(echo));
+  }
+  return res.json({
+    ok: true,
+    service: SERVICE_NAME,
+    version: VERSION,
+    message: "Webhook Zadarma activo. Esperando eventos POST.",
+  });
+});
+
+// POST — recepción de eventos reales de Zadarma
 app.post("/webhooks/zadarma/notify_record", async (req, res) => {
-  // Zadarma puede mandar JSON o form-urlencoded
   const body = req.body || {};
 
-  console.log("[Zadarma NOTIFY_RECORD] Payload recibido:", JSON.stringify(body));
-
-  // Verificación de seguridad opcional
-  if (SECURITY_TOKEN && body.zd_echo !== undefined) {
-    // Zadarma hace una petición de verificación al configurar el webhook
-    return res.send(body.zd_echo);
+  // Por si zd_echo llega también en POST
+  if (req.query.zd_echo !== undefined) {
+    res.setHeader("Content-Type", "text/plain");
+    return res.send(String(req.query.zd_echo));
   }
+
+  console.log("[Zadarma NOTIFY_RECORD] Payload recibido:", JSON.stringify(body));
 
   // Solo procesamos eventos de grabación
   const event = body.event || body.notification_type || "";
