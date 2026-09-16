@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.7.0-sat";
+const VERSION      = "v3.7.1-sat";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -225,7 +225,7 @@ function parseGeminiJSON(rawText) {
 }
 
 async function geminiRequest(parts) {
-  const model = "gemini-2.0-flash";
+  const model = "gemini-3.6-flash";
   const url   = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   const t0    = Date.now();
   const resp  = await fetch(url, {
