@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.6.1";
+const VERSION      = "v3.7.0-sat";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -48,8 +48,8 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ── MIDDLEWARE ───────────────────────────────────────────────────────────────
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
@@ -980,6 +980,123 @@ app.post("/lead/analyze-and-create", async (req, res) => {
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SAT PIZNALIA — análisis técnico y lectura de máquinas (v3.7)
+//  Aislado de los flujos Zadarma, leads y tickets existentes.
+// ════════════════════════════════════════════════════════════════════════════
+const SAT_API_KEY = process.env.SAT_API_KEY || "";
+const satRate = new Map();
+function satAuth(req, res, next) {
+  if (!SAT_API_KEY) return res.status(503).json({ ok: false, error: "sat_not_configured" });
+  const supplied = String(req.get("x-sat-api-key") || "");
+  const a = Buffer.from(supplied), b = Buffer.from(SAT_API_KEY);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).json({ ok: false, error: "unauthorized" });
+  next();
+}
+function satRateLimit(req, res, next) {
+  const key = req.ip || "unknown", now = Date.now();
+  const item = satRate.get(key) || { count: 0, reset: now + 60000 };
+  if (now > item.reset) { item.count = 0; item.reset = now + 60000; }
+  item.count += 1; satRate.set(key, item);
+  if (item.count > 30) return res.status(429).json({ ok: false, error: "rate_limit" });
+  next();
+}
+function satJson(raw) {
+  const i = raw.indexOf("{"), j = raw.lastIndexOf("}");
+  if (i < 0 || j <= i) throw new Error("La IA no devolvió JSON válido");
+  return JSON.parse(raw.slice(i, j + 1));
+}
+function satPrompt(instructions, context) {
+  return `${instructions || "Eres el asistente técnico del SAT de Piznalia."}
+
+Devuelve exclusivamente JSON válido con esta estructura:
+{"transcript":"","title":"","symptom":"","diagnostic_tests":[],"results":[],"diagnosis":"","probable_cause":"","cause":"","solution":"","tools":[],"parts":[],"outcome":"","warnings":[],"reusable_conclusion":"","missing_information":[],"follow_up_questions":[],"confidence":0}
+Reglas: no inventes; separa hechos de hipótesis; confidence es 0-100; si falta información formula preguntas breves. La transcripción debe ser fiel. Contexto disponible:
+${JSON.stringify(context || {})}`;
+}
+async function satAnalyzeParts(parts) {
+  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY no configurada");
+  const raw = await geminiRequest(parts);
+  const parsed = satJson(raw);
+  return {
+    transcript: String(parsed.transcript || ""),
+    structured: {
+      title: parsed.title || "", symptom: parsed.symptom || "",
+      diagnostic_tests: parsed.diagnostic_tests || [], results: parsed.results || [],
+      diagnosis: parsed.diagnosis || "", probable_cause: parsed.probable_cause || "",
+      cause: parsed.cause || "", solution: parsed.solution || "",
+      tools: parsed.tools || [], parts: parsed.parts || [], outcome: parsed.outcome || "",
+      warnings: parsed.warnings || [], reusable_conclusion: parsed.reusable_conclusion || "",
+      missing_information: parsed.missing_information || [],
+      follow_up_questions: parsed.follow_up_questions || [],
+      confidence: Number(parsed.confidence || 0),
+    },
+  };
+}
+
+app.get("/sat/machines", satAuth, satRateLimit, async (_req, res) => {
+  try {
+    const uid = await odooAuth();
+    const available = await odooExec(uid, "x_maquina_operador", "fields_get", [], { attributes: ["type"] }, 201);
+    const candidates = ["x_name","x_studio_x_machine_uid","x_estado","x_ubicacion","x_studio_x_propietario","x_studio_x_cliente","x_partner_id","x_mac_code"];
+    const fields = candidates.filter(name => available && available[name]);
+    const rows = await odooExec(uid, "x_maquina_operador", "search_read", [[]], {
+      fields, limit: 500, order: "id asc"
+    }, 202);
+    const machines = (rows || []).filter(row => String(row.x_name || "").trim().toLowerCase() !== "stock").map(row => ({
+      id: row.id,
+      name: row.x_name || `Máquina ${row.id}`,
+      machine_uid: row.x_studio_x_machine_uid || null,
+      status: row.x_estado || null,
+      location: row.x_ubicacion || null,
+      customer: row.x_studio_x_propietario || row.x_studio_x_cliente || row.x_partner_id || null,
+      mac_code: row.x_mac_code || null,
+    }));
+    return res.json({ ok: true, machines });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.post("/sat/analyze", satAuth, satRateLimit, async (req, res) => {
+  const text = String(req.body?.text || "").trim();
+  if (!text) return res.status(400).json({ ok: false, error: "missing_text" });
+  try {
+    const prompt = satPrompt(req.body?.instructions, {
+      case: req.body?.case || {}, validatedKnowledge: req.body?.validatedKnowledge || [],
+    }) + `\n\nTexto explicado por el usuario o técnico:\n${text}\nMantén este texto como transcript.`;
+    const result = await satAnalyzeParts([{ text: prompt }]);
+    if (!result.transcript) result.transcript = text;
+    return res.json({ ok: true, ...result });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.post("/sat/analyze-audio", satAuth, satRateLimit, async (req, res) => {
+  const data = String(req.body?.audioBase64 || ""), mimeType = String(req.body?.mimeType || "audio/webm");
+  if (!data) return res.status(400).json({ ok: false, error: "missing_audio" });
+  if (data.length > 22 * 1024 * 1024) return res.status(413).json({ ok: false, error: "audio_too_large" });
+  try {
+    const prompt = satPrompt(req.body?.instructions, {
+      case: req.body?.case || {}, validatedKnowledge: req.body?.validatedKnowledge || [],
+    }) + "\n\nEscucha el audio, transcríbelo fielmente y estructura el caso técnico.";
+    const result = await satAnalyzeParts([{ inline_data: { mime_type: mimeType, data } }, { text: prompt }]);
+    return res.json({ ok: true, ...result });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.post("/sat/analyze-images", satAuth, satRateLimit, async (req, res) => {
+  const images = Array.isArray(req.body?.images) ? req.body.images.slice(0, 8) : [];
+  if (!images.length) return res.status(400).json({ ok: false, error: "missing_images" });
+  try {
+    const parts = images.map(image => ({ inline_data: {
+      mime_type: String(image.mimeType || "image/jpeg"), data: String(image.base64 || "")
+    }}));
+    parts.push({ text: `Analiza estas imágenes de una máquina SmartChef24h. Compara las marcadas como referencia correcta con las del problema y posteriores a reparación.
+Devuelve exclusivamente JSON válido: {"visible_differences":[],"possible_causes":[],"recommended_checks":[],"missing_photos":[],"limitations":[],"confidence":0}.
+No afirmes causas que no sean visualmente demostrables. Contexto: ${JSON.stringify(req.body?.context || {})}` });
+    const raw = await geminiRequest(parts);
+    return res.json({ ok: true, analysis: satJson(raw) });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
 // ── ARRANQUE ─────────────────────────────────────────────────────────────────
