@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.7.1-sat";
+const VERSION      = "v3.8.0-sat";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -1097,6 +1097,74 @@ No afirmes causas que no sean visualmente demostrables. Contexto: ${JSON.stringi
     const raw = await geminiRequest(parts);
     return res.json({ ok: true, analysis: satJson(raw) });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SAT PIZNALIA — creación idempotente de tickets Helpdesk
+//  No añade seguidores, no publica mensajes y no envía avisos al cliente.
+// ════════════════════════════════════════════════════════════════════════════
+app.post("/sat/tickets", satAuth, satRateLimit, async (req, res) => {
+  const body = req.body || {};
+  const satCaseId = String(body.satCaseId || "").trim();
+  const title = String(body.title || "").trim();
+  if (!satCaseId || !title) return res.status(400).json({ ok: false, error: "missing_case_data" });
+  const marker = `[SAT-CASE-ID:${satCaseId}]`;
+  try {
+    const uid = await odooAuth();
+    const existing = await odooExec(uid, "helpdesk.ticket", "search_read",
+      [[["description", "ilike", marker]]],
+      { fields: ["id", "name"], limit: 1 }, 230);
+    if (existing && existing.length) {
+      return res.json({ ok: true, status: "ALREADY_LINKED", ticketId: existing[0].id, ticketName: existing[0].name });
+    }
+
+    let machineRecord = null;
+    if (body.machineId) {
+      const machineFields = await odooExec(uid, "x_maquina_operador", "fields_get", [], { attributes: ["type"] }, 231);
+      const uidField = machineFields?.x_studio_x_machine_uid ? "x_studio_x_machine_uid" : null;
+      if (uidField) {
+        const machines = await odooExec(uid, "x_maquina_operador", "search_read",
+          [[[uidField, "=", String(body.machineId)]]],
+          { fields: ["id", "x_name"], limit: 1 }, 232);
+        machineRecord = machines?.[0] || null;
+      }
+    }
+
+    const ticketFields = await odooExec(uid, "helpdesk.ticket", "fields_get", [], { attributes: ["type"] }, 233);
+    const teamId = await getHelpdeskTeamId(uid);
+    const priorityMap = { low: "0", normal: "1", high: "2", urgent: "3" };
+    const description = [
+      marker,
+      "<p><strong>Caso creado desde SAT Piznalia</strong></p>",
+      `<p><strong>ID SAT:</strong> ${satCaseId}</p>`,
+      body.machineId ? `<p><strong>Máquina:</strong> ${String(body.machineId)}</p>` : "",
+      body.symptom ? `<p><strong>Síntoma inicial:</strong> ${String(body.symptom).replace(/[<>]/g, "")}</p>` : "",
+      "<p><em>Creado sin notificación automática al cliente.</em></p>",
+    ].filter(Boolean).join("");
+
+    const vals = {
+      name: `${satCaseId} · ${title}`,
+      description,
+      priority: priorityMap[String(body.priority || "normal")] || "1",
+      team_id: teamId || undefined,
+      user_id: uid,
+      partner_name: body.clientId ? String(body.clientId) : undefined,
+      partner_phone: body.contactPhone ? String(body.contactPhone) : undefined,
+    };
+    if (machineRecord && ticketFields?.x_studio_x_maquina_id) vals.x_studio_x_maquina_id = machineRecord.id;
+
+    const ticketId = await odooExec(uid, "helpdesk.ticket", "create", [[vals]], {
+      context: {
+        tracking_disable: true,
+        mail_create_nosubscribe: true,
+        mail_notrack: true,
+        mail_notify_force_send: false,
+      },
+    }, 234);
+    return res.status(201).json({ ok: true, status: "CREATED", ticketId, ticketName: vals.name });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // ── ARRANQUE ─────────────────────────────────────────────────────────────────
