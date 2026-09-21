@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.8.0-sat";
+const VERSION      = "v3.8.1-zadarma-phone-dedup";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -32,6 +32,8 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ""; // solo fallback Whispe
 // ── CACHE (extensión por llamada) ────────────────────────────────────────────
 const callCache = new Map();
 const CALL_CACHE_TTL = 10 * 60 * 1000;
+const processingCallIds = new Map();
+const PROCESSED_CALL_TTL = 24 * 60 * 60 * 1000;
 
 function cacheSet(pbxCallId, data) {
   callCache.set(pbxCallId, { ...data, ttl: Date.now() + CALL_CACHE_TTL });
@@ -42,10 +44,12 @@ function cacheGet(pbxCallId) {
   if (Date.now() > e.ttl) { callCache.delete(pbxCallId); return null; }
   return e;
 }
-setInterval(() => {
+const cacheCleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [k, v] of callCache.entries()) if (now > v.ttl) callCache.delete(k);
+  for (const [k, ttl] of processingCallIds.entries()) if (now > ttl) processingCallIds.delete(k);
 }, 5 * 60 * 1000);
+cacheCleanupTimer.unref();
 
 // ── MIDDLEWARE ───────────────────────────────────────────────────────────────
 app.use(express.json({ limit: "20mb" }));
@@ -426,23 +430,62 @@ async function analyzeCallFromOdoo(uid, callIdWithRec, callerPhone, extensionInf
 // ════════════════════════════════════════════════════════════════════════════
 //  ODOO CRM — contactos, máquinas, leads, tickets, notas
 // ════════════════════════════════════════════════════════════════════════════
+function normalizePhoneE164(phone, defaultCountryCode = "34") {
+  let value = String(phone || "").trim();
+  if (!value) return null;
+  value = value.replace(/(?:ext\.?|x)\s*\d+$/i, "").trim();
+  let digits = value.replace(/\D/g, "");
+  if (digits.startsWith("00")) digits = digits.slice(2);
+  else if (value.startsWith("+")) {
+    // Los dígitos ya incluyen el prefijo internacional.
+  } else if (digits.length === 9) {
+    digits = `${defaultCountryCode}${digits}`;
+  }
+  if (digits.length < 8 || digits.length > 15) return null;
+  return `+${digits}`;
+}
+
+function partnerMatchesPhone(partner, normalizedPhone) {
+  return [partner.phone, partner.mobile]
+    .some(value => normalizePhoneE164(value) === normalizedPhone);
+}
+
+async function findPartnersByNormalizedPhone(uid, phone) {
+  const normalizedPhone = normalizePhoneE164(phone);
+  if (!normalizedPhone) return { normalizedPhone: null, partners: [] };
+  const nationalNumber = normalizedPhone.startsWith("+34")
+    ? normalizedPhone.slice(3)
+    : normalizedPhone.replace(/^\+/, "");
+  const loosePattern = nationalNumber.split("").join("%");
+  const partners = await odooExec(uid, "res.partner", "search_read", [[
+    "|", "|", "|",
+    ["phone", "ilike", normalizedPhone],
+    ["mobile", "ilike", normalizedPhone],
+    ["phone", "ilike", loosePattern],
+    ["mobile", "ilike", loosePattern],
+  ]], { fields: ["id", "name", "phone", "mobile"], limit: 100 }, 10);
+  const exact = (partners || []).filter(p => partnerMatchesPhone(p, normalizedPhone));
+  const unique = [...new Map(exact.map(p => [p.id, p])).values()];
+  return { normalizedPhone, partners: unique };
+}
+
 async function findOrCreatePartner(uid, { name, phone, email }) {
-  const digits = String(phone || "").replace(/\D/g, "").slice(-9);
-  if (digits) {
-    const ids = await odooExec(uid, "res.partner", "search",
-      [[["phone", "ilike", digits]]], { limit: 1 }, 10);
-    if (ids?.[0]) {
-      console.log(`[Odoo] Contacto existente: #${ids[0]}`);
-      return { partnerId: ids[0], isNew: false };
-    }
+  const { normalizedPhone, partners } = await findPartnersByNormalizedPhone(uid, phone);
+  if (partners.length === 1) {
+    console.log(`[Odoo] Contacto existente por teléfono normalizado ${normalizedPhone}: #${partners[0].id}`);
+    return { partnerId: partners[0].id, isNew: false, normalizedPhone };
+  }
+  if (partners.length > 1) {
+    console.warn(`[Odoo] Teléfono ambiguo ${normalizedPhone}: contactos ${partners.map(p => p.id).join(", ")}. No se crea contacto.`);
+    return { partnerId: null, isNew: false, ambiguous: true, candidateIds: partners.map(p => p.id), normalizedPhone };
   }
   const partnerName = (name && name.trim().length > 2 && name.toLowerCase() !== "llamada")
     ? name.trim() : (phone ? `Tel. ${phone}` : "Contacto sin nombre");
   const newId = await odooExec(uid, "res.partner", "create", [[{
-    name: partnerName, phone: phone || undefined, email: email || undefined,
+    name: partnerName, phone: normalizedPhone || phone || undefined, email: email || undefined,
   }]], {}, 11);
   console.log(`[Odoo] Contacto nuevo: #${newId} — ${partnerName}`);
-  return { partnerId: newId, isNew: true };
+  return { partnerId: newId, isNew: true, normalizedPhone };
 }
 
 async function findMachinesByPartner(uid, partnerId) {
@@ -567,7 +610,11 @@ async function postNoteToModel(uid, model, recordId, body) {
 }
 
 // Construir texto de nota (reutilizable para contacto, lead y ticket)
-function buildNoteBody(ai, callerPhone, extensionInfo) {
+function callMarker(callId) {
+  return callId ? `[ZADARMA-CALL-ID:${String(callId).replace(/[<>]/g, "")}]` : "";
+}
+
+function buildNoteBody(ai, callerPhone, extensionInfo, callId) {
   const catMap = {
     venta_maquina: "Venta máquina", venta_pizza: "Venta pizzas",
     operador_vending: "Operador vending", averia: "Avería",
@@ -627,11 +674,13 @@ function buildNoteBody(ai, callerPhone, extensionInfo) {
   lines.push(``);
   lines.push(`Urgencia: ${urgMap[ai.urgencia]||ai.urgencia} | Categoría: ${catMap[ai.categoria]||ai.categoria}`);
 
+  if (callId) lines.push("", callMarker(callId));
   return lines.join("\n");
 }
 
 async function postNoteToPartner(uid, partnerId, ai, callerPhone, extensionInfo, callId) {
-  const body = buildNoteBody(ai, callerPhone, extensionInfo);
+  if (!partnerId) return;
+  const body = buildNoteBody(ai, callerPhone, extensionInfo, callId);
   await postNoteToModel(uid, "res.partner", partnerId, body);
 }
 
@@ -677,6 +726,7 @@ async function createLead(uid, ai, callerPhone, callerName, partnerId, extension
     hour: "2-digit", minute: "2-digit"
   });
   const description = `
+<p><small>${callMarker(callId)}</small></p>
 <p><strong>📞 Llamada recibida</strong> &nbsp; <em>${horaLead}</em><br/>
 <strong>Teléfono:</strong> ${callerPhone||"?"} &nbsp; <strong>Extensión:</strong> ${extensionInfo||"?"}</p>
 <p><strong>🤖 Resumen:</strong> ${ai.resumen||""}</p>
@@ -703,7 +753,7 @@ ${contactoLines2 ? `<p><strong>👤 Datos del cliente:</strong><br/>${contactoLi
   console.log(`[Odoo] Lead #${leadId}: ${vals.name}`);
 
   // Nota en chatter del lead
-  const noteBody = buildNoteBody(ai, callerPhone, extensionInfo);
+  const noteBody = buildNoteBody(ai, callerPhone, extensionInfo, callId);
   await postNoteToModel(uid, "crm.lead", leadId, noteBody);
 
   return leadId;
@@ -726,6 +776,7 @@ async function createTicket(uid, ai, callerPhone, callerName, partnerId, machine
   });
 
   const description = `
+<p><small>${callMarker(callId)}</small></p>
 <p><strong>📞 Llamada SAT recibida</strong> &nbsp; <em>${horaTicket}</em><br/>
 <strong>Teléfono:</strong> ${callerPhone||"?"} &nbsp; <strong>Extensión:</strong> ${extensionInfo||"?"}</p>
 
@@ -765,7 +816,7 @@ ${c.mac_digitos ? `<p><strong>🔢 Dígitos máquina mencionados:</strong> ${c.m
   console.log(`[Odoo] Ticket #${ticketId}${machineUnique ? ` — ${machineUnique.x_name}` : ""}`);
 
   // Nota en chatter del ticket
-  const ticketNote = buildNoteBody(ai, callerPhone, extensionInfo);
+  const ticketNote = buildNoteBody(ai, callerPhone, extensionInfo, callId);
   await postNoteToModel(uid, "helpdesk.ticket", ticketId, ticketNote);
 
   return ticketId;
@@ -833,6 +884,20 @@ async function processCallWithAI({ ai, callerPhone, callerName, extensionInfo, c
   return { created: "lead", id: leadId, ai };
 }
 
+async function wasCallAlreadyProcessed(uid, callId) {
+  if (!callId) return false;
+  const marker = callMarker(callId);
+  for (const [model, field] of [["crm.lead", "description"], ["helpdesk.ticket", "description"], ["mail.message", "body"]]) {
+    try {
+      const ids = await odooExec(uid, model, "search", [[[field, "ilike", marker]]], { limit: 1 }, 79);
+      if (ids?.length) return true;
+    } catch (err) {
+      console.warn(`[Idempotencia] No se pudo comprobar ${model}: ${err.message}`);
+    }
+  }
+  return false;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 //  WEBHOOK ZADARMA
 // ════════════════════════════════════════════════════════════════════════════
@@ -877,6 +942,10 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
   if (!callIdWithRec)
     return res.status(400).json({ ok: false, error: "missing_call_id_with_rec" });
 
+  if (processingCallIds.has(callIdWithRec))
+    return res.json({ ok: true, duplicate: true, received: callIdWithRec });
+  processingCallIds.set(callIdWithRec, Date.now() + PROCESSED_CALL_TTL);
+
   res.json({ ok: true, service: SERVICE_NAME, received: callIdWithRec });
 
   const cached      = pbxCallId ? cacheGet(pbxCallId) : null;
@@ -888,6 +957,10 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
   setImmediate(async () => {
     try {
       const uid    = await odooAuth();
+      if (await wasCallAlreadyProcessed(uid, callIdWithRec)) {
+        console.log(`[Idempotencia] Llamada ya procesada: ${callIdWithRec}`);
+        return;
+      }
       const ai     = await analyzeCallFromOdoo(uid, callIdWithRec, callerPhone, extInfo);
       const result = await processCallWithAI({ ai, callerPhone, callerName, extensionInfo: extInfo, callId: callIdWithRec });
       console.log(`[OK] ${result.created} #${result.id} | ${result.ai.resumen}`);
@@ -911,7 +984,10 @@ app.post("/webhooks/zadarma/notify_record", async (req, res) => {
           const leadId = await createLead(uid, aiFallback, callerPhone, callerName, partnerRes?.partnerId || null, extInfo, callIdWithRec);
           console.log(`[Fallback] Lead nuevo #${leadId}`);
         }
-      } catch (e2) { console.error("[Fallback] Falló:", e2.message); }
+      } catch (e2) {
+        processingCallIds.delete(callIdWithRec);
+        console.error("[Fallback] Falló:", e2.message);
+      }
     }
   });
 });
@@ -1168,10 +1244,14 @@ app.post("/sat/tickets", satAuth, satRateLimit, async (req, res) => {
 });
 
 // ── ARRANQUE ─────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`[${SERVICE_NAME}] ${VERSION} puerto ${PORT}`);
-  console.log(`  Odoo:    ${ODOO_BASE_URL || "⚠ NO CONFIG"}`);
-  console.log(`  Gemini:  ${GEMINI_API_KEY ? "✓ activo (principal)" : "⚠ NO CONFIG"}`);
-  console.log(`  Whisper: ${OPENAI_API_KEY ? "✓ disponible (fallback)" : "— no configurado (opcional)"}`);
-});
+if (require.main === module) {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`[${SERVICE_NAME}] ${VERSION} puerto ${PORT}`);
+    console.log(`  Odoo:    ${ODOO_BASE_URL || "⚠ NO CONFIG"}`);
+    console.log(`  Gemini:  ${GEMINI_API_KEY ? "✓ activo (principal)" : "⚠ NO CONFIG"}`);
+    console.log(`  Whisper: ${OPENAI_API_KEY ? "✓ disponible (fallback)" : "— no configurado (opcional)"}`);
+  });
+}
+
+module.exports = { normalizePhoneE164, partnerMatchesPhone };
