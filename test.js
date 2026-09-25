@@ -11,3 +11,12 @@ assert.equal(partnerMatchesPhone({ phone: false, mobile: "0034603509208" }, "+34
 assert.equal(partnerMatchesPhone({ phone: "+34600000000", mobile: false }, "+34603509208"), false);
 
 console.log("Phone normalization tests passed");
+
+
+const synthetic = { id: 10, name: "Llamada saliente (647436423)", phone: "647436423", mobile: false, email: false };
+const real = { id: 11, name: "Miguel Pacheco", phone: "+34647436423", mobile: false, email: "info@delbox.es" };
+const picked = require("./index").pickCanonicalPhoneMatch([synthetic, real]);
+assert.equal(picked.partner.id, 11);
+assert.deepEqual(picked.syntheticPartners.map(p => p.id), [10]);
+assert.equal(require("./index").isSyntheticZadarmaPartner(synthetic), true);
+assert.equal(require("./index").isSyntheticZadarmaPartner(real), false);
