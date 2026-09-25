@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.8.2-zadarma-outbound-dedup";
+const VERSION      = "v3.8.3-zadarma-phone-field-fix";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -446,8 +446,7 @@ function normalizePhoneE164(phone, defaultCountryCode = "34") {
 }
 
 function partnerMatchesPhone(partner, normalizedPhone) {
-  return [partner.phone, partner.mobile]
-    .some(value => normalizePhoneE164(value) === normalizedPhone);
+  return normalizePhoneE164(partner?.phone) === normalizedPhone;
 }
 
 function isSyntheticZadarmaPartner(partner) {
@@ -521,12 +520,10 @@ async function findPartnersByNormalizedPhone(uid, phone) {
     : normalizedPhone.replace(/^\+/, "");
   const loosePattern = nationalNumber.split("").join("%");
   const partners = await odooExec(uid, "res.partner", "search_read", [[
-    "|", "|", "|",
+    "|",
     ["phone", "ilike", normalizedPhone],
-    ["mobile", "ilike", normalizedPhone],
     ["phone", "ilike", loosePattern],
-    ["mobile", "ilike", loosePattern],
-  ]], { fields: ["id", "name", "phone", "mobile", "email"], limit: 100 }, 10);
+  ]], { fields: ["id", "name", "phone", "email"], limit: 100 }, 10);
   const exact = (partners || []).filter(p => partnerMatchesPhone(p, normalizedPhone));
   const unique = [...new Map(exact.map(p => [p.id, p])).values()];
   return { normalizedPhone, partners: unique };
