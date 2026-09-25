@@ -16,7 +16,7 @@ const crypto  = require("crypto");
 const app     = express();
 
 const SERVICE_NAME = "odoo-ai-connector";
-const VERSION      = "v3.8.1-zadarma-phone-dedup";
+const VERSION      = "v3.8.2-zadarma-outbound-dedup";
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const ODOO_BASE_URL           = (process.env.ODOO_BASE_URL || "").replace(/\/+$/, "");
@@ -450,6 +450,69 @@ function partnerMatchesPhone(partner, normalizedPhone) {
     .some(value => normalizePhoneE164(value) === normalizedPhone);
 }
 
+function isSyntheticZadarmaPartner(partner) {
+  const name = String(partner?.name || "").trim();
+  const email = String(partner?.email || "").trim();
+  return /^Llamada\s+(saliente|entrante)\s*\(/i.test(name) && !email;
+}
+
+function pickCanonicalPhoneMatch(partners) {
+  const rows = Array.isArray(partners) ? partners : [];
+  if (rows.length === 1) {
+    return { partner: rows[0], syntheticPartners: [], ambiguous: false };
+  }
+
+  const syntheticPartners = rows.filter(isSyntheticZadarmaPartner);
+  const canonicalPartners = rows.filter(p => !isSyntheticZadarmaPartner(p));
+
+  // Caso típico Zadarma saliente: el conector nativo crea un contacto provisional
+  // "Llamada saliente (...)" aunque ya exista el contacto real con el mismo teléfono.
+  if (canonicalPartners.length === 1 && syntheticPartners.length >= 1) {
+    return {
+      partner: canonicalPartners[0],
+      syntheticPartners,
+      ambiguous: false,
+    };
+  }
+
+  return { partner: null, syntheticPartners, ambiguous: rows.length > 1 };
+}
+
+async function reconcileSyntheticZadarmaPartners(uid, canonicalPartnerId, syntheticPartners) {
+  const syntheticIds = [...new Set((syntheticPartners || [])
+    .map(p => Number(p?.id))
+    .filter(id => Number.isInteger(id) && id > 0 && id !== Number(canonicalPartnerId)))];
+
+  if (!canonicalPartnerId || syntheticIds.length === 0) return;
+
+  // Reubicar grabaciones/adjuntos del contacto provisional al contacto real.
+  try {
+    const attachments = await odooExec(uid, "ir.attachment", "search_read", [[
+      ["res_model", "=", "res.partner"],
+      ["res_id", "in", syntheticIds],
+    ]], { fields: ["id", "name", "res_id"], limit: 200 }, 13);
+
+    const attachmentIds = (attachments || []).map(a => a.id).filter(Boolean);
+    if (attachmentIds.length) {
+      await odooExec(uid, "ir.attachment", "write",
+        [attachmentIds, { res_id: canonicalPartnerId }], {}, 14);
+      console.log(`[Odoo] ${attachmentIds.length} adjunto(s) Zadarma movidos a contacto #${canonicalPartnerId}`);
+    }
+  } catch (e) {
+    console.warn("[Odoo] No se pudieron reubicar adjuntos Zadarma:", e.message);
+  }
+
+  // No fusionamos contactos automáticamente: archivamos solo los contactos
+  // provisionales creados por Zadarma, de forma reversible.
+  try {
+    await odooExec(uid, "res.partner", "write",
+      [syntheticIds, { active: false }], {}, 15);
+    console.log(`[Odoo] Contactos provisionales Zadarma archivados: ${syntheticIds.join(", ")} → canonical #${canonicalPartnerId}`);
+  } catch (e) {
+    console.warn("[Odoo] No se pudieron archivar contactos provisionales Zadarma:", e.message);
+  }
+}
+
 async function findPartnersByNormalizedPhone(uid, phone) {
   const normalizedPhone = normalizePhoneE164(phone);
   if (!normalizedPhone) return { normalizedPhone: null, partners: [] };
@@ -463,7 +526,7 @@ async function findPartnersByNormalizedPhone(uid, phone) {
     ["mobile", "ilike", normalizedPhone],
     ["phone", "ilike", loosePattern],
     ["mobile", "ilike", loosePattern],
-  ]], { fields: ["id", "name", "phone", "mobile"], limit: 100 }, 10);
+  ]], { fields: ["id", "name", "phone", "mobile", "email"], limit: 100 }, 10);
   const exact = (partners || []).filter(p => partnerMatchesPhone(p, normalizedPhone));
   const unique = [...new Map(exact.map(p => [p.id, p])).values()];
   return { normalizedPhone, partners: unique };
@@ -471,10 +534,21 @@ async function findPartnersByNormalizedPhone(uid, phone) {
 
 async function findOrCreatePartner(uid, { name, phone, email }) {
   const { normalizedPhone, partners } = await findPartnersByNormalizedPhone(uid, phone);
-  if (partners.length === 1) {
-    console.log(`[Odoo] Contacto existente por teléfono normalizado ${normalizedPhone}: #${partners[0].id}`);
-    return { partnerId: partners[0].id, isNew: false, normalizedPhone };
+  const picked = pickCanonicalPhoneMatch(partners);
+
+  if (picked.partner) {
+    if (picked.syntheticPartners.length) {
+      await reconcileSyntheticZadarmaPartners(uid, picked.partner.id, picked.syntheticPartners);
+    }
+    console.log(`[Odoo] Contacto existente por teléfono normalizado ${normalizedPhone}: #${picked.partner.id}`);
+    return {
+      partnerId: picked.partner.id,
+      isNew: false,
+      normalizedPhone,
+      reconciledSyntheticIds: picked.syntheticPartners.map(p => p.id),
+    };
   }
+
   if (partners.length > 1) {
     console.warn(`[Odoo] Teléfono ambiguo ${normalizedPhone}: contactos ${partners.map(p => p.id).join(", ")}. No se crea contacto.`);
     return { partnerId: null, isNew: false, ambiguous: true, candidateIds: partners.map(p => p.id), normalizedPhone };
@@ -1254,4 +1328,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { normalizePhoneE164, partnerMatchesPhone };
+module.exports = { normalizePhoneE164, partnerMatchesPhone, isSyntheticZadarmaPartner, pickCanonicalPhoneMatch };
