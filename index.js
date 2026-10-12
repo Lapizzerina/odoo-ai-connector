@@ -1160,7 +1160,7 @@ function satPrompt(instructions, context) {
   return `${instructions || "Eres el asistente técnico del SAT de Piznalia."}
 
 Devuelve exclusivamente JSON válido con esta estructura:
-{"transcript":"","title":"","symptom":"","diagnostic_tests":[],"results":[],"diagnosis":"","probable_cause":"","cause":"","solution":"","tools":[],"parts":[],"outcome":"","warnings":[],"reusable_conclusion":"","missing_information":[],"follow_up_questions":[],"confidence":0}
+{"response_text":"","memory_summary":"","transcript":"","title":"","symptom":"","diagnostic_tests":[],"results":[],"diagnosis":"","probable_cause":"","cause":"","solution":"","tools":[],"parts":[],"outcome":"","warnings":[],"reusable_conclusion":"","missing_information":[],"follow_up_questions":[],"confidence":0}
 Reglas: no inventes; separa hechos de hipótesis; confidence es 0-100; si falta información formula preguntas breves. La transcripción debe ser fiel. Contexto disponible:
 ${JSON.stringify(context || {})}`;
 }
@@ -1187,6 +1187,7 @@ async function satAnalyzeParts(parts) {
   return {
     transcript: String(parsed.transcript || ""),
     structured: {
+      response_text: String(parsed.response_text || ""), memory_summary: String(parsed.memory_summary || ""),
       title: parsed.title || "", symptom: parsed.symptom || "",
       diagnostic_tests: parsed.diagnostic_tests || [], results: parsed.results || [],
       diagnosis: parsed.diagnosis || "", probable_cause: parsed.probable_cause || "",
@@ -1228,7 +1229,7 @@ app.post("/sat/analyze", satAuth, satRateLimit, async (req, res) => {
   try {
     const prompt = satPrompt(req.body?.instructions, {
       case: req.body?.case || {}, validatedKnowledge: req.body?.validatedKnowledge || [],
-      conversation: req.body?.conversation || [], validatedDocuments: req.body?.validatedDocuments || [],
+      caseMemory: req.body?.caseMemory || {}, conversation: req.body?.conversation || [], validatedDocuments: req.body?.validatedDocuments || [],
     }) + `\n\nTexto explicado por el usuario o técnico:\n${text}\nMantén este texto como transcript.`;
     const result = await satAnalyzeParts([{ text: prompt }]);
     if (!result.transcript) result.transcript = text;
@@ -1243,7 +1244,7 @@ app.post("/sat/analyze-audio", satAuth, satRateLimit, async (req, res) => {
   try {
     const prompt = satPrompt(req.body?.instructions, {
       case: req.body?.case || {}, validatedKnowledge: req.body?.validatedKnowledge || [],
-      conversation: req.body?.conversation || [], validatedDocuments: req.body?.validatedDocuments || [],
+      caseMemory: req.body?.caseMemory || {}, conversation: req.body?.conversation || [], validatedDocuments: req.body?.validatedDocuments || [],
     }) + "\n\nEscucha el audio, transcríbelo fielmente y estructura el caso técnico.";
     const result = await satAnalyzeParts([{ inline_data: { mime_type: mimeType, data } }, { text: prompt }]);
     return res.json({ ok: true, ...result });
