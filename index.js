@@ -228,11 +228,12 @@ function parseGeminiJSON(rawText) {
   };
 }
 
-async function geminiRequest(parts) {
+async function geminiRequest(parts, timeoutMs) {
   const model = "gemini-3.6-flash";
   const url   = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   const t0    = Date.now();
   const resp  = await fetch(url, {
+    ...(timeoutMs ? {signal:AbortSignal.timeout(timeoutMs)} : {}),
     method: "POST",
     headers: { "x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json" },
     body: JSON.stringify({ contents: [{ role: "user", parts }] }),
@@ -1164,8 +1165,24 @@ Reglas: no inventes; separa hechos de hipótesis; confidence es 0-100; si falta 
 ${JSON.stringify(context || {})}`;
 }
 async function satAnalyzeParts(parts) {
-  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY no configurada");
-  const raw = await geminiRequest(parts);
+  let raw;
+  try {
+    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY no configurada");
+    raw = await geminiRequest(parts, 18000);
+  } catch (error) {
+    // SAT-only fallback: reuse the text/image provider already configured for calls.
+    // Audio/video require their original multimodal provider; never claim to have read them.
+    if (!OPENAI_API_KEY || parts.some(p => p.inline_data && !String(p.inline_data.mime_type).startsWith("image/"))) throw error;
+    const content = parts.map(p => p.text ? {type:"text",text:p.text} : {type:"image_url",image_url:{url:`data:${p.inline_data.mime_type};base64,${p.inline_data.data}`}});
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      signal: AbortSignal.timeout(20000), method:"POST",
+      headers:{"Content-Type":"application/json","Authorization":`Bearer ${OPENAI_API_KEY}`},
+      body:JSON.stringify({model:"gpt-4o-mini",messages:[{role:"user",content}],response_format:{type:"json_object"},max_tokens:2000})
+    });
+    if (!response.ok) throw new Error(`SAT fallback HTTP ${response.status}`);
+    const data = await response.json(); raw = data?.choices?.[0]?.message?.content || "";
+    if (!raw) throw new Error("SAT fallback devolvió contenido vacío");
+  }
   const parsed = satJson(raw);
   return {
     transcript: String(parsed.transcript || ""),
@@ -1211,6 +1228,7 @@ app.post("/sat/analyze", satAuth, satRateLimit, async (req, res) => {
   try {
     const prompt = satPrompt(req.body?.instructions, {
       case: req.body?.case || {}, validatedKnowledge: req.body?.validatedKnowledge || [],
+      conversation: req.body?.conversation || [], validatedDocuments: req.body?.validatedDocuments || [],
     }) + `\n\nTexto explicado por el usuario o técnico:\n${text}\nMantén este texto como transcript.`;
     const result = await satAnalyzeParts([{ text: prompt }]);
     if (!result.transcript) result.transcript = text;
@@ -1225,6 +1243,7 @@ app.post("/sat/analyze-audio", satAuth, satRateLimit, async (req, res) => {
   try {
     const prompt = satPrompt(req.body?.instructions, {
       case: req.body?.case || {}, validatedKnowledge: req.body?.validatedKnowledge || [],
+      conversation: req.body?.conversation || [], validatedDocuments: req.body?.validatedDocuments || [],
     }) + "\n\nEscucha el audio, transcríbelo fielmente y estructura el caso técnico.";
     const result = await satAnalyzeParts([{ inline_data: { mime_type: mimeType, data } }, { text: prompt }]);
     return res.json({ ok: true, ...result });
@@ -1241,7 +1260,7 @@ app.post("/sat/analyze-images", satAuth, satRateLimit, async (req, res) => {
     parts.push({ text: `Analiza estas imágenes de una máquina SmartChef24h. Compara las marcadas como referencia correcta con las del problema y posteriores a reparación.
 Devuelve exclusivamente JSON válido: {"visible_differences":[],"possible_causes":[],"recommended_checks":[],"missing_photos":[],"limitations":[],"confidence":0}.
 No afirmes causas que no sean visualmente demostrables. Contexto: ${JSON.stringify(req.body?.context || {})}` });
-    const raw = await geminiRequest(parts);
+    const raw = await geminiRequest(parts, 18000);
     return res.json({ ok: true, analysis: satJson(raw) });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
